@@ -1,1 +1,4 @@
 pytest>=8.0.0
+streamlit>=1.35.0
+sympy>=1.12.0
+numpy>=1.24.0
