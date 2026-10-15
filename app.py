@@ -1,182 +1,306 @@
-import random
-import time
-from typing import List, Tuple
 import streamlit as st
-
-# --- Core Business Logic & Models ---
-
-class Direction:
-    UP = (0, -1)
-    DOWN = (0, 1)
-    LEFT = (-1, 0)
-    RIGHT = (1, 0)
+import streamlit.components.v1 as components
+import random
+from typing import List, Tuple, Dict, Any
 
 class SnakeGameEngine:
+    """Core business logic engine for the Classical Snake Game."""
     def __init__(self, width: int = 20, height: int = 20):
         self.width = width
         self.height = height
         self.reset()
 
     def reset(self):
-        # Initial snake in the middle
+        """Resets the game state to initial values."""
         start_x = self.width // 2
         start_y = self.height // 2
-        self.snake: List[Tuple[int, int]] = [
+        self.snake = [
             (start_x, start_y),
             (start_x - 1, start_y),
             (start_x - 2, start_y)
         ]
-        self.direction = Direction.RIGHT
-        self.next_direction = Direction.RIGHT
+        self.direction = "RIGHT"
+        self.next_direction = "RIGHT"
         self.score = 0
         self.game_over = False
-        self.paused = False
-        self.food = self._spawn_food()
+        self.spawn_food()
 
-    def _spawn_food(self) -> Tuple[int, int]:
+    def spawn_food(self):
+        """Spawns food at a random unoccupied grid coordinate."""
         while True:
             fx = random.randint(0, self.width - 1)
             fy = random.randint(0, self.height - 1)
             if (fx, fy) not in self.snake:
-                return (fx, fy)
+                self.food = (fx, fy)
+                break
 
-    def change_direction(self, new_direction: Tuple[int, int]):
-        # Prevent 180-degree immediate turns
-        current = self.direction
-        if (new_direction[0] * -1, new_direction[1] * -1) != current:
-            self.next_direction = new_direction
+    def set_direction(self, new_dir: str):
+        """Queues a new direction, preventing immediate 180-degree reversals."""
+        opposites = {
+            "UP": "DOWN",
+            "DOWN": "UP",
+            "LEFT": "RIGHT",
+            "RIGHT": "LEFT"
+        }
+        if new_dir in opposites and opposites[new_dir] != self.direction:
+            self.next_direction = new_dir
 
-    def step(self):
-        pass
-
-    def update(self) -> bool:
-        if self.game_over or self.paused:
-            return False
+    def step(self) -> Dict[str, Any]:
+        """Advances the game state by one tick."""
+        if self.game_over:
+            return self.get_state()
 
         self.direction = self.next_direction
         head_x, head_y = self.snake[0]
-        dx, dy = self.direction
+
+        dx, dy = 0, 0
+        if self.direction == "UP":
+            dy = -1
+        elif self.direction == "DOWN":
+            dy = 1
+        elif self.direction == "LEFT":
+            dx = -1
+        elif self.direction == "RIGHT":
+            dx = 1
+
         new_head = (head_x + dx, head_y + dy)
 
         # Wall collision
         if not (0 <= new_head[0] < self.width and 0 <= new_head[1] < self.height):
             self.game_over = True
-            return False
+            return self.get_state()
 
         # Self collision
         if new_head in self.snake:
             self.game_over = True
-            return False
+            return self.get_state()
 
         self.snake.insert(0, new_head)
 
-        # Food collision
+        # Food consumption
         if new_head == self.food:
             self.score += 10
-            self.food = self._spawn_food()
+            self.spawn_food()
         else:
             self.snake.pop()
 
-        return True
+        return self.get_state()
 
-    def render_board_grid(self) -> List[List[str]]:
-        # Grid representation: '.' for empty, 'S' for snake body, 'H' for head, 'F' for food
-        grid = [['.' for _ in range(self.width)] for _ in range(self.height)]
+    def get_state(self) -> Dict[str, Any]:
+        """Returns the current state dictionary of the game."""
+        return {
+            "snake": self.snake,
+            "food": self.food,
+            "score": self.score,
+            "game_over": self.game_over,
+            "width": self.width,
+            "height": self.height
+        }
+
+def render_game_component(game_state: Dict[str, Any], speed_ms: int):
+    """Renders the interactive HTML5 Canvas game with real-time keyboard controls."""
+    html_code = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <style>
+        body {{
+            background-color: #0e1117;
+            color: #ffffff;
+            font-family: sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+        }} 
+        canvas {{
+            border: 4px solid #4e8cff;
+            background-color: #1a1c23;
+            box-shadow: 0px 0px 20px rgba(78, 140, 255, 0.4);
+            border-radius: 8px;
+        }}
+        #info {{
+            margin-top: 10px;
+            font-size: 16px;
+            color: #a0aec0;
+        }}
+    </style>
+    </head>
+    <body>
+        <canvas id="gameCanvas" width="400" height="400"></canvas>
+        <div id="info">Use Arrow Keys to Move | Space to Restart</div>
+
+    <script>
+        const canvas = document.getElementById("gameCanvas");
+        const ctx = canvas.getContext("2d");
         
-        # Place food
-        fx, fy = self.food
-        grid[fy][fx] = 'F'
+        const gridWidth = {game_state['width']};
+        const gridHeight = {game_state['height']};
+        const tileSize = canvas.width / gridWidth;
 
-        # Place snake body
-        for i, (sx, sy) in enumerate(self.snake):
-            if 0 <= sx < self.width and 0 <= sy < self.height:
-                grid[sy][sx] = 'H' if i == 0 else 'S'
+        let gameState = {str(game_state).replace("'", '"')};
+        let speed = {speed_ms};
 
-        return grid
+        function draw() {{
+            ctx.fillStyle = "#1a1c23";
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
 
+            // Draw Grid Lines (subtle)
+            ctx.strokeStyle = "#262938";
+            ctx.lineWidth = 0.5;
+            for (let i = 0; i <= gridWidth; i++) {{
+                ctx.beginPath();
+                ctx.moveTo(i * tileSize, 0);
+                ctx.lineTo(i * tileSize, canvas.height);
+                ctx.stroke();
+            }}
+            for (let j = 0; j <= gridHeight; j++) {{
+                ctx.beginPath();
+                ctx.moveTo(0, j * tileSize);
+                ctx.lineTo(canvas.width, j * tileSize);
+                ctx.stroke();
+            }}
 
-# --- Streamlit UI Layer ---
+            // Draw Food
+            ctx.fillStyle = "#ff4d4d";
+            ctx.shadowBlur = 10;
+            ctx.shadowColor = "#ff4d4d";
+            ctx.fillRect(gameState.food[0] * tileSize + 2, gameState.food[1] * tileSize + 2, tileSize - 4, tileSize - 4);
+            
+            // Draw Snake
+            ctx.shadowBlur = 5;
+            gameState.snake.forEach((segment, index) => {{
+                ctx.fillStyle = index === 0 ? "#4e8cff" : "#2ecc71";
+                ctx.shadowColor = index === 0 ? "#4e8cff" : "#2ecc71";
+                ctx.fillRect(segment[0] * tileSize + 1, segment[1] * tileSize + 1, tileSize - 2, tileSize - 2);
+            }});
+
+            ctx.shadowBlur = 0;
+
+            if (gameState.game_over) {{
+                ctx.fillStyle = "rgba(0, 0, 0, 0.75)";
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.fillStyle = "#ffffff";
+                ctx.font = "bold 30px sans-serif";
+                ctx.textAlign = "center";
+                ctx.fillText("GAME OVER", canvas.width / 2, canvas.height / 2 - 10);
+                ctx.font = "16px sans-serif";
+                ctx.fillText("Press SPACE to restart", canvas.width / 2, canvas.height / 2 + 25);
+            }}
+        }}
+
+        window.addEventListener("keydown", e => {{
+            if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(e.key)) {{
+                e.preventDefault();
+            }}
+            
+            let dir = null;
+            if (e.key === "ArrowUp") dir = "UP";
+            if (e.key === "ArrowDown") dir = "DOWN";
+            if (e.key === "ArrowLeft") dir = "LEFT";
+            if (e.key === "ArrowRight") dir = "RIGHT";
+            
+            if (dir) {{
+                window.parent.postMessage({type: "streamlit:setComponentValue", value: {action: "dir", direction: dir}}, "*");
+            }}
+
+            if (e.key === " " && gameState.game_over) {{
+                window.parent.postMessage({type: "streamlit:setComponentValue", value: {action: "restart"}}, "*");
+            }}
+        }});
+
+        // Auto tick interval loop
+        setInterval(() => {{
+            if (!gameState.game_over) {{
+                window.parent.postMessage({type: "streamlit:setComponentValue", value: {action: "tick"}}, "*");
+            }}
+        }}, speed);
+
+        draw();
+    </script>
+    </body>
+    </html>
+    """
+    return components.html(html_code, height=450, width=420)
 
 def main():
-    st.set_page_config(page_title="Classic Snake Game", page_icon="🐍", layout="centered")
+    st.set_page_config(page_title="Classical Snake Game", page_icon="🐍", layout="centered")
 
-    st.title("🐍 Classic Snake Game in Streamlit")
-    st.markdown("Use the control buttons below to steer the snake. Eat the food (`🍎`) to grow and score points! Avoid hitting the walls and yourself (`🟩`).")
+    st.title("🐍 Classical Snake Game")
+    st.markdown("Experience the retro arcade classic built with Streamlit. Use your **Keyboard Arrow Keys** to steer the snake. Eat food, grow longer, and avoid walls and your own tail!")
 
-    # Initialize game state in session
+    # Sidebar Configuration
+    st.sidebar.header("Game Controls & Settings")
+    speed_setting = st.sidebar.selectbox("Difficulty / Speed", ["Normal", "Fast", "Expert"], index=0)
+    speed_map = {"Normal": 150, "Fast": 100, "Expert": 70}
+    current_speed = speed_map[speed_setting]
+
+    if st.sidebar.button("Restart Game"):
+        st.session_state.game = SnakeGameEngine()
+        st.rerun()
+
+    # Initialize Game State in Streamlit session
     if "game" not in st.session_state:
-        st.session_state.game = SnakeGameEngine(width=15, height=15)
-        st.session_state.speed = 0.4
+        st.session_state.game = SnakeGameEngine()
 
     game: SnakeGameEngine = st.session_state.game
 
-    # Sidebar settings
-    st.sidebar.header("Game Controls & Settings")
-    
-    if st.sidebar.button("🔄 Restart Game"):
-        game.reset()
-        st.rerun()
+    # Metrics KPI Display
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric(label="Current Score", value=game.score)
+    with col2:
+        st.metric(label="Snake Length", value=len(game.snake))
+    with col3:
+        status = "Game Over ❌" if game.game_over else "Playing 🟢"
+        st.metric(label="Status", value=status)
 
-    st.session_state.speed = st.sidebar.slider("Game Speed (sec/step)", 0.1, 1.0, 0.3, 0.05)
+    # Render the interactive component and catch client events
+    val = render_game_component(game.get_state(), current_speed)
 
-    col_k1, col_k2, col_k3 = st.columns([1, 1, 1])
-    
-    # Button controls handlers
-    with col_k2:
-        if st.button("⬆️ UP", use_container_width=True):
-            game.change_direction(Direction.UP)
-            game.update()
+    # Event handler bridge from JS component
+    if val and isinstance(val, dict):
+        action = val.get("action")
+        if action == "dir":
+            game.set_direction(val.get("direction"))
+            st.rerun()
+        elif action == "tick":
+            game.step()
+            st.rerun()
+        elif action == "restart":
+            game.reset()
             st.rerun()
 
-    col_l1, col_l2, col_l3 = st.columns([1, 1, 1])
-    with col_l1:
-        if st.button("⬅️ LEFT", use_container_width=True):
-            game.change_direction(Direction.LEFT)
-            game.update()
+    # Manual fallback controls for accessibility
+    st.markdown("### Manual Controls (Fallback)")
+    b1, b2, b3 = st.columns([1, 1, 1])
+    with b2:
+        if st.button("⬆️ UP"):
+            game.set_direction("UP")
+            game.step()
             st.rerun()
-    with col_l2:
-        if st.button("⏸️ PAUSE/STEP", use_container_width=True):
-            if not game.game_over:
-                game.update()
-                st.rerun()
-    with col_l3:
-        if st.button("➡️ RIGHT", use_container_width=True):
-            game.change_direction(Direction.RIGHT)
-            game.update()
+    b4, b5, b6 = st.columns([3, 3, 3])
+    with b4:
+        if st.button("⬅️ LEFT"):
+            game.set_direction("LEFT")
+            game.step()
             st.rerun()
-
-    with col_k2:
-        if st.button("⬇️ DOWN", use_container_width=True):
-            game.change_direction(Direction.DOWN)
-            game.update()
+    with b5:
+        if st.button("🔄 STEP / TICK"):
+            game.step()
             st.rerun()
-
-    # Score metrics
-    metric_col1, metric_col2 = st.columns(2)
-    metric_col1.metric("Score", game.score)
-    status = "Game Over 💀" if game.game_over else ("Paused ⏸️" if game.paused else "Playing 🟢")
-    metric_col2.metric("Status", status)
-
-    if game.game_over:
-        st.error("Game Over! Click 'Restart Game' in the sidebar to play again.")
-
-    # Render board visually using colored markdown/HTML grid or text representation
-    grid = game.render_board_grid()
-    
-    # Emoji map for human readability
-    mapping = {
-        '.': '⬛',
-        'S': '🟩',
-        'H': '🟢',
-        'F': '🍎'
-    }
-
-    board_html = "<div style='font-family: monospace; font-size: 24px; line-height: 1.2; text-align: center;'>"
-    for row in grid:
-        board_html += "".join([mapping.get(cell, '⬛') for cell in row]) + "<br>"
-    board_html += "</div>"
-
-    st.markdown(board_html, unsafe_allow_html=True)
+    with b6:
+        if st.button("➡️ RIGHT"):
+            game.set_direction("RIGHT")
+            game.step()
+            st.rerun()
+    with b2:
+        if st.button("⬇️ DOWN"):
+            game.set_direction("DOWN")
+            game.step()
+            st.rerun()
 
 if __name__ == "__main__":
     main()
