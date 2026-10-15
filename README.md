@@ -1,6 +1,6 @@
 # Generated Application
 
-**Requirement:** Build a functional kangoroo game similar to google dyno game to check if its working compare it with the google dyno game and also check if its visually similar and is made for humans to play simple like dyno
+**Requirement:** build the classical snake game
 
 **Format:** Streamlit Web App
 
