@@ -1,59 +1,52 @@
+import os
 import pytest
-from app import KangorooGameEngine, render_game_canvas
+from app import GameScoreManager
 
-def test_engine_initialization():
-    engine = KangorooGameEngine()
-    assert engine.kangaroo_y == 0.0
-    assert engine.is_jumping is False
-    assert engine.score == 0
-    assert engine.game_over is False
-    assert len(engine.obstacles) == 0
+@pytest.fixture
+def score_manager(tmp_path):
+    temp_file = tmp_path / "test_scores.json"
+    manager = GameScoreManager(storage_file=str(temp_file))
+    return manager
 
-def test_kangaroo_jump():
-    engine = KangorooGameEngine()
-    engine.jump()
-    assert engine.is_jumping is True
-    assert engine.kangaroo_vy < 0.0  # Moving upwards
+def test_load_empty_scores(score_manager):
+    """Test that loading scores from a non-existent file returns an empty list."""
+    scores = score_manager.load_scores()
+    assert scores == []
 
-    # Test update simulation after jump
-    engine.update(dt=1.0)
-    assert engine.kangaroo_y < 0.0  # Off the ground
+def test_save_and_load_scores(score_manager):
+    """Test saving a score correctly persists and returns sorted scores."""
+    score_manager.save_score("Alice", 120)
+    score_manager.save_score("Bob", 250)
+    score_manager.save_score("Charlie", 80)
 
-def test_ground_collision():
-    engine = KangorooGameEngine()
-    engine.jump()
-    # Simulate multiple ticks until kangaroo lands back on ground
-    for _ in range(50):
-        engine.update(dt=1.0)
-    
-    assert engine.kangaroo_y == 0.0
-    assert engine.is_jumping is False
+    scores = score_manager.load_scores()
+    assert len(scores) == 3
+    # Check sorting (descending by score)
+    assert scores[0]["player_name"] == "Bob"
+    assert scores[0]["score"] == 250
+    assert scores[1]["player_name"] == "Alice"
+    assert scores[1]["score"] == 120
+    assert scores[2]["player_name"] == "Charlie"
+    assert scores[2]["score"] == 80
 
-def test_obstacle_spawn_and_collision():
-    engine = KangorooGameEngine()
-    # Force an obstacle right at kangaroo position (x=50)
-    engine.obstacles.append({
-        'x': 55.0,
-        'y': 0.0,
-        'width': 20.0,
-        'height': 20.0,
-        'type': 'rock'
-    })
-    
-    # Update should detect collision
-    engine.update(dt=0.1)
-    assert engine.game_over is True
+def test_get_high_score(score_manager):
+    """Test high score retrieval returns the maximum score or 0 when empty."""
+    assert score_manager.get_high_score() == 0
 
-def test_score_progression():
-    engine = KangorooGameEngine()
-    engine.update(dt=2.0)
-    assert engine.score == 20
-    assert engine.high_score == 20
+    score_manager.save_score("Player1", 50)
+    score_manager.save_score(
+        "Player2", 300
+    )
+    score_manager.save_score("Player3", 150)
 
-def test_render_game_canvas_svg():
-    engine = KangorooGameEngine()
-    state = engine.get_render_state()
-    svg_output = render_game_canvas(state)
-    assert '<svg' in svg_output
-    assert '</svg>' in svg_output
-    assert 'HI 00000  00000' in svg_output
+    assert score_manager.get_high_score() == 300
+
+def test_max_scores_limit(score_manager):
+    """Test that leaderboard truncates to top 10 scores."""
+    for i in range(15):
+        score_manager.save_score(f"Player{i}", i * 10)
+
+    scores = score_manager.load_scores()
+    assert len(scores) == 10
+    # Highest score should be 140
+    assert score_manager.get_high_score() == 140

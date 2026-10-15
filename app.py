@@ -1,221 +1,414 @@
-import time
-import random
-from typing import Dict, List, Any, Optional
 import streamlit as st
+import streamlit.components.v1 as components
+import json
+import os
+from datetime import datetime
+from typing import Dict, Any, List
 
-class KangorooGameEngine:
-    """Core physics, state machine, and collision engine for the Kangoroo Game."""
-    def __init__(self, gravity: float = 0.6, jump_velocity: float = -11.0, game_speed: float = 6.0):
-        self.gravity = gravity
-        self.jump_velocity = jump_velocity
-        self.base_game_speed = game_speed
-        self.reset()
+# --- Business Logic & State Management ---
 
-    """Game reset method"""
-    def reset(self):
-        self.kangaroo_y = 0.0
-        self.kangaroo_vy = 0.0
-        self.is_jumping = False
-        self.obstacles: List[Dict[str, float]] = []
-        self.score = 0
-        self.high_score = getattr(self, 'high_score', 0)
-        self.game_over = False
-        self.game_time = 0.0
-        self.spawn_timer = 0.0
+class GameScoreManager:
+    """Manages game scores, high scores, and statistics persistence."""
+    def __init__(self, storage_file: str = "game_scores.json"):
+        self.storage_file = storage_file
 
-    def jump(self):
-        """Initiate a jump if the kangaroo is on the ground."""
-        if not self.is_jumping and not self.game_over:
-            self.kangaroo_vy = self.jump_velocity
-            self.is_jumping = True
+    def load_scores(self) -> List[Dict[str, Any]]:
+        if not os.path.exists(self.storage_file):
+            return []
+        try:
+            with open(self.storage_file, "r") as f:
+                return json.load(f)
+        except Exception:
+            return []
 
-    def update(self, dt: float = 1.0):
-        """Update game physics and positions by one tick."""
-        if self.game_over:
-            return
+    def save_score(self, player_name: str, score: int) -> List[Dict[str, Any]]:
+        scores = self.load_scores()
+        scores.append({
+            "player_name": player_name,
+            "score": score,
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        })
+        # Sort descending by score and keep top 10
+        scores = sorted(scores, key=lambda x: x["score"], reverse=True)[:10]
+        try:
+            with open(self.storage_file, "w") as f:
+                json.dump(scores, f)
+        except Exception:
+            pass
+        return scores
 
-        self.game_time += dt
-        self.score += int(dt * 10)
-        if self.score > self.high_score:
-            self.high_score = self.score
+    def get_high_score(self) -> int:
+        scores = self.load_scores()
+        if not scores:
+            return 0
+        return max(s["score"] for s in scores)
 
-        # Apply gravity
-        self.kangaroo_vy += self.gravity
-        self.kangaroo_y += self.kangaroo_vy
 
-        # Ground collision
-        if self.kangaroo_y >= 0.0:
-            self.kangaroo_y = 0.0
-            self.kangaroo_vy = 0.0
-            self.is_jumping = False
+# --- HTML5 / JS Kangaroo Game Component ---
 
-        # Spawn obstacles
-        self.spawn_timer += dt
-        current_speed = self.base_game_speed + (self.score / 200.0)
-        
-        if self.spawn_timer >= random.uniform(25.0, 45.0) / current_speed:
-            obstacle_type = random.choice(['bush', 'rock', 'baobab'])
-            width = 25.0 if obstacle_type == 'bush' else (35.0 if obstacle_type == 'baobab' else 20.0)
-            height = 30.0 if obstacle_type == 'baobab' else 20.0
-            self.obstacles.append({
-                'x': 400.0,
-                'y': 0.0,
-                'width': width,
-                'height': height,
-                'type': obstacle_type
-            })
-            self.spawn_timer = 0.0
+KANGAROO_GAME_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Kangaroo Hopper Game</title>
+    <style>
+        body {
+            margin: 0;
+            background: #f7f7f7;
+            font-family: 'Courier New', Courier, monospace;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            overflow: hidden;
+        }
+        #game-container {
+            text-align: center;
+            background: #ffffff;
+            padding: 10px;
+            border-radius: 8px;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+        }
+        canvas {
+            background: #fdfdfd;
+            border-bottom: 2px solid #535353;
+            display: block;
+            margin: 0 auto;
+        }
+        .instructions {
+            margin-top: 10px;
+            font-size: 14px;
+            color: #535353;
+        }
+    </style>
+</head>
+<body>
+    <div id="game-container">
+        <canvas id="gameCanvas" width="800" height="250"></canvas>
+        <div class="instructions">
+            Press <strong>SPACEBAR</strong> or <strong>UP ARROW</strong> to Jump | <strong>DOWN ARROW</strong> to Duck
+        </div>
+    </div>
 
-        # Move obstacles
-        remaining_obstacles = []
-        for obs in self.obstacles:
-            obs['x'] -= current_speed
-            if obs['x'] > -50:
-                remaining_obstacles.append(obs)
+    <script>
+        const canvas = document.getElementById("gameCanvas");
+        const ctx = canvas.getContext("2d");
 
-            # Check collision (Kangaroo box: x=50 to 80, y=kangaroo_y to kangaroo_y-40)
-            # Obstacle box: x=obs['x'] to obs['x']+obs['width'], y=0 to -obs['height']
-            k_left = 50.0
-            k_right = 75.0
-            k_bottom = self.kangaroo_y
-            k_top = self.kangaroo_y - 40.0
+        let gameSpeed = 6;
+        let score = 0;
+        let highScore = 0;
+        let isGameOver = false;
+        let isPlaying = false;
 
-            o_left = obs['x']
-            o_right = obs['x'] + obs['width']
-            o_bottom = 0.0
-            o_top = -obs['height']
+        // Kangaroo Object
+        const kangaroo = {
+            x: 50,
+            y: 160,
+            width: 40,
+            height: 50,
+            vy: 0,
+            gravity: 0.6,
+            jumpPower: -11,
+            isJumping: false,
+            isDucking: false,
+            originalHeight: 50,
+            duckHeight: 30
+        };
 
-            if not (k_right < o_left or k_left > o_right or k_bottom < o_top or k_top > o_bottom):
-                self.game_over = True
+        let obstacles = [];
+        let clouds = [];
+        let frameCount = 0;
 
-        self.obstacles = remaining_obstacles
-
-    def get_render_state(self) -> Dict[str, Any]:
-        """Returns serializable state for rendering."""
-        return {
-            'kangaroo_y': self.kangaroo_y,
-            'is_jumping': self.is_jumping,
-            'obstacles': self.obstacles,
-            'score': self.score,
-            'high_score': self.high_score,
-            'game_over': self.game_over
+        class Obstacle {
+            constructor() {
+                this.width = 25 + Math.random() * 20;
+                this.height = 35 + Math.random() * 25;
+                this.x = canvas.width;
+                this.y = 210 - this.height;
+                this.passed = false;
+            }
+            draw() {
+                ctx.fillStyle = "#535353";
+                // Draw cactus / bush obstacle
+                ctx.fillRect(this.x, this.y, this.width, this.height);
+                // Add cute spikes
+                ctx.fillStyle = "#fff";
+                ctx.fillRect(this.x + 5, this.y + 5, 3, 6);
+            }
+            update() {
+                this.x -= gameSpeed;
+            }
         }
 
+        class Cloud {
+            constructor() {
+                this.x = canvas.width + Math.random() * 100;
+                this.y = 30 + Math.random() * 50;
+                this.width = 50;
+                this.height = 20;
+                this.speed = 1.5;
+            }
+            draw() {
+                ctx.fillStyle = "#e0e0e0";
+                ctx.fillRect(this.x, this.y, this.width, this.height);
+            }
+            update() {
+                this.x -= this.speed;
+            }
+        }
 
-def render_game_canvas(state: Dict[str, Any]) -> str:
-        """Generates an SVG string representing the game state visually."""
-        k_y_svg = 150 + state['kangaroo_y']
-        
-        obstacles_svg = ""
-        for obs in state['obstacles']:
-            o_x = obs['x']
-            o_type = obs['type']
-            if o_type == 'bush':
-                obstacles_svg += f'<rect x="{o_x}" y="130" width="{obs["width"]}" height="25" rx="8" fill="#2e7d32" />'
-            elif o_type == 'baobab':
-                obstacles_svg += f'<rect x="{o_x + 10}" y="110" width="15" height="40" fill="#795548" />'
-                obstacles_svg += f'<circle cx="{o_x + 17.5}" cy="110" r="18" fill="#388e3c" />'
-            else:
-                obstacles_svg += f'<polygon points="{o_x},{155} {o_x + 10},{125} {o_x + 20},{155}" fill="#616161" />'
+        function resetGame() {
+            score = 0;
+            gameSpeed = 6;
+            obstacles = [];
+            clouds = [];
+            kangaroo.y = 160;
+            kangaroo.vy = 0;
+            kangaroo.isJumping = false;
+            isGameOver = false;
+            isPlaying = true;
+            loop();
+        }
 
-        svg = f'''
-        <svg width="100%" height="220" viewBox="0 0 400 220" style="background: linear-gradient(to bottom, #e3f2fd, #bbdefb); border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
-            <!-- Sun -->
-            <circle cx="350" cy="40" r="22" fill="#ffeb3b" opacity="0.9" />
-            
-            <!-- Ground -->
-            <line x1="0" y1="155" x2="400" y2="155" stroke="#8d6e63" stroke-width="4" />
-            <rect x="0" y="157" width="400" height="63" fill="#d7ccc8" />
+        // Input listeners
+        window.addEventListener("keydown", function(e) {
+            if (e.code === "Space" || e.code === "ArrowUp") {
+                e.preventDefault();
+                if (!isPlaying && !isGameOver) {
+                    resetGame();
+                } else if (isPlaying && !kangaroo.isJumping && !kangaroo.isDucking) {
+                    kangaroo.vy = kangaroo.jumpPower;
+                    kangaroo.isJumping = true;
+                } else if (isGameOver) {
+                    resetGame();
+                }
+            }
+            if (e.code === "ArrowDown") {
+                e.preventDefault();
+                if (isPlaying && !kangaroo.isJumping) {
+                    kangaroo.isDucking = true;
+                    kangaroo.height = kangaroo.duckHeight;
+                    kangaroo.y = 180;
+                }
+            }
+        });
 
-            <!-- Obstacles -->
-            {obstacles_svg}
+        window.addEventListener("keyup", function(e) {
+            if (e.code === "ArrowDown") {
+                if (isPlaying && kangaroo.isDucking) {
+                    kangaroo.isDucking = false;
+                    kangaroo.height = kangaroo.originalHeight;
+                    kangaroo.y = 160;
+                }
+            }
+        });
 
-            <!-- Kangaroo -->
-            <g transform="translate(50, {k_y_svg})">
-                <!-- Body -->
-                <ellipse cx="15" cy="-20" rx="14" ry="18" fill="#ffb74d" />
-                <!-- Head -->
-                <circle cx="22" cy="-38" r="10" fill="#ffb74d" />
-                <!-- Ear -->
-                <ellipse cx="26" cy="-50" rx="3" ry="8" fill="#ffa726" />
-                <!-- Snout -->
-                <ellipse cx="28" cy="-36" rx="4" ry="3" fill="#ffa726" />
-                <!-- Tail -->
-                <path d="M 2 -15 Q -10 -25 -6 -35" stroke="#ffb74d" stroke-width="5" fill="none" stroke-linecap="round" />
-                <!-- Legs / Pouch -->
-                <rect x="8" y="-10" width="12" height="10" rx="4" fill="#ffa726" />
-                <circle cx="14" cy="-15" r="4" fill="#ffe0b2" />
-            </g>
+        canvas.addEventListener("click", function() {
+            if (!isPlaying || isGameOver) {
+                resetGame();
+            }
+        });
 
-            <!-- Scoreboard -->
-            <text x="20" y="30" font-family="monospace" font-size="18" font-weight="bold" fill="#37474f">HI {state["high_score"]:05d}  {state["score"]:05d}</text>
-        </svg>
-        '''
-        return svg
+        function spawnObstacles() {
+            if (frameCount % Math.max(70, 140 - Math.floor(gameSpeed * 5)) === 0) {
+                obstacles.push(new Obstacle());
+            }
+        }
 
+        function spawnClouds() {
+            if (frameCount % 180 === 0) {
+                clouds.push(new Cloud());
+            }
+        }
+
+        function drawGround() {
+            ctx.strokeStyle = "#535353";
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(0, 210);
+            ctx.lineTo(canvas.width, 210);
+            ctx.stroke();
+        }
+
+        function drawKangaroo() {
+            ctx.fillStyle = "#ff8c00"; // Kangaroo orange/brown color
+            // Body
+            ctx.fillRect(kangaroo.x, kangaroo.y, kangaroo.width, kangaroo.height);
+            // Head & Ears
+            ctx.fillRect(kangaroo.x + kangaroo.width - 15, kangaroo.y - 20, 20, 25);
+            ctx.fillStyle = "#535353";
+            ctx.fillRect(kangaroo.x + kangaroo.width - 10, kangaroo.y - 28, 5, 10);
+            // Tail
+            ctx.fillRect(kangaroo.x - 12, kangaroo.y + 10, 12, 12);
+        }
+
+        function checkCollision(rect1, rect2) {
+            return (
+                rect1.x < rect2.x + rect2.width &&
+                rect1.x + rect1.width > rect2.x &&
+                rect1.y < rect2.y + rect2.height &&
+                rect1.y + rect1.height > rect2.y
+            );
+        }
+
+        function drawStartScreen() {
+            ctx.fillStyle = "#535353";
+            ctx.font = "20px 'Courier New'";
+            ctx.textAlign = "center";
+            ctx.fillText("PRESS SPACEBAR OR CLICK TO START", canvas.width / 2, canvas.height / 2);
+        }
+
+        function loop() {
+            if (!isPlaying) return;
+
+            frameCount++;
+            gameSpeed += 0.001; // Gradual difficulty increase
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // Clouds update and draw
+            spawnClouds();
+            clouds.forEach((cloud, index) => {
+                cloud.update();
+                cloud.draw();
+                if (cloud.x + cloud.width < 0) clouds.splice(index, 1);
+            });
+
+            drawGround();
+
+            // Kangaroo physics
+            kangaroo.vy += kangaroo.gravity;
+            kangaroo.y += kangaroo.vy;
+
+            const groundLevel = kangaroo.isDucking ? 180 : 160;
+            if (kangaroo.y > groundLevel) {
+                kangaroo.y = groundLevel;
+                kangaroo.vy = 0;
+                kangaroo.isJumping = false;
+            }
+
+            drawKangaroo();
+
+            // Obstacles update and draw
+
+            spawnObstacles();
+            obstacles.forEach((obs, index) => {
+                obs.update();
+                obs.draw();
+
+                if (checkCollision(kangaroo, obs)) {
+                    isGameOver = true;
+                    isPlaying = false;
+                }
+
+                if (obs.x + obs.width < 0) {
+                    obstacles.splice(index, 1);
+                    score += 10;
+                    if (score > highScores) highScore = score;
+                }
+            });
+
+            // Scoreboard UI on canvas
+            ctx.fillStyle = "#535353";
+            ctx.font = "16px 'Courier New'";
+            ctx.textAlign = "right";
+            ctx.fillText("HI: " + Math.floor(highScore) + "  SC: " + Math.floor(score), canvas.width - 20, 30);
+
+            if (isGameOver) {
+                ctx.fillStyle = "rgba(0, 0, 0, 0.6)";
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.fillStyle = "#ffffff";
+                ctx.font = "24px 'Courier New'";
+                ctx.textAlign = "center";
+                ctx.fillText("GAME OVER - PRESS SPACE TO RESTART", canvas.width / 2, canvas.height / 2);
+                return;
+            }
+
+            requestAnimationFrame(loop);
+        }
+
+        // Initial Render
+        drawGround();
+        drawKangaroo();
+        drawStartScreen();
+    </script>
+</body>
+</html>
+"""
+
+
+# --- Streamlit Application UI ---
 
 def main():
-    st.set_page_config(page_title="Kangoroo Jump Game", page_icon="🦘", layout="centered")
+    st.set_page_config(
+        page_title="Kangaroo Hopper (Dino Game Clone)",
+        page_icon="🦘",
+        layout="centered"
+    )
 
-    st.title("🦘 Kangoroo Jump (Google Dino Clone)")
-    st.markdown("Help the Outback Kangaroo dodge native Australian obstacles! Compare this gameplay mechanics with the classic Google Chrome Dino game.")
+    st.title("🦘 Kangaroo Hopper Game")
+    st.markdown(
+        "A classic infinite runner game inspired by the legendary Google Chrome Dino game, "
+        "featuring a jumping kangaroo avoiding obstacles in the outback!"
+    )
 
-    # Initialize session state for game engine
-    if 'engine' not in st.session_state:
-        st.session_state.engine = KangorooGameEngine()
-        st.session_state.playing = False
+    score_manager = GameScoreManager()
 
-    engine: KangorooGameEngine = st.session_state.engine
+    # Sidebar controls & comparison
+    with st.sidebar:
+        st.header("🎮 Game Controls")
+        st.info(
+            "**How to Play:**\n"
+            "- Click inside the game window first to focus.\n"
+            "- Press **SPACEBAR** or **UP ARROW** to Jump.\n"
+            "- Press **DOWN ARROW** to Duck.\n"
+            "- Avoid incoming bushes and obstacles!"
+        )
 
-    col1, col2, col3 = st.columns([2, 1, 1])
-    with col1:
-        if st.button("🦘 JUMP! (Space / Click)", use_container_width=True, type="primary"):
-            engine.jump()
-            if not st.session_state.playing and not engine.game_over:
-                st.session_state.playing = True
-    with col2:
-        if st.button("🔄 Reset Game", use_container_width=True):
-            engine.reset()
-            st.session_state.playing = False
-    with col3:
-        difficulty = st.selectbox("Speed Mode", ["Normal", "Fast", "Extreme"], index=0)
-        if difficulty == "Normal":
-            engine.base_game_speed = 6.0
-        elif difficulty == "Fast":
-            engine.base_game_speed = 8.5
-        else:
-            engine.base_game_speed = 11.0
+        st.markdown("---")
+        st.subheader("📊 Google Dino vs Kangaroo")
+        st.markdown(
+            "| Feature | Google Dino | Kangaroo Hopper |\n"
+            "| :--- | :--- | :--- |\n"
+            "| **Protagonist** | T-Rex Dinosaur | Australian Kangaroo |\n"
+            "| **Environment** | Desert / Night | Outback / Clouds |\n"
+            "| **Controls** | Space / Down | Space / Up / Down |\n"
+            "| **Engine** | HTML5 Canvas | HTML5 Canvas |\n"
+            "| **Difficulty** | Progressive | Progressive |"
+        )
 
-    # Game Container
-    canvas_placeholder = st.empty()
+        st.markdown("---")
+        st.subheader("🏆 High Scores")
+        high_score = score_manager.get_high_score()
+        st.metric(label="Global Best Score", value=high_score)
 
-    # Render current state
-    state = engine.get_render_state()
-    canvas_placeholder.markdown(render_game_canvas(state), unsafe_allow_html=True)
+        with st.form("score_submit_form"):
+            st.markdown("**Record Your Score**")
+            player_name = st.text_input("Player Name", "Outback Explorer")
+            recorded_score = st.number_input("Score Achieved", min_value=0, step=10, value=0)
+            submit_score = st.form_submit_button("Save Score")
 
-    # Metrics & Comparison
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Current Score", state['score'])
-    m2.metric("High Score", state['high_score'])
-    m3.metric("Status", "💥 Game Over" if state['game_over'] else ("▶️ Running" if st.session_state.playing else "⏸️ Ready"))
+            if submit_score:
+                score_manager.save_score(player_name, int(recorded_score))
+                st.success(f"Score of {recorded_score} saved for {player_name}!")
 
-    with st.expander("🔍 Compare with Google Dino Game"):
-        st.markdown("""
-        ### Google Chrome Dino Game vs. Kangoroo Jump Game
-        | Feature | Google Chrome Dino | Kangoroo Jump Arcade |
-        | :--- | :--- | :--- |
-        | **Protagonist** | T-Rex Dinosaur | Australian Kangaroo 🦘 |
-        | **Environment** | Prehistoric desert with cacti & Pterodactyls | Outback desert with bushes, rocks & baobab trees |
-        | **Physics Engine** | Gravity, constant acceleration, ducking mechanics | Gravity, parabolic jump arcs, variable velocity |
-        | **Speed Progression** | Increments gradually with distance score | Dynamic speed scaling based on score & mode selection |
-        | **Tech Stack** | C++ / JS Canvas in Chromium Browser | Python backend + Streamlit Reactive UI & SVG rendering |
-        """)
+    # Main Game Area
+    st.subheader("Play Area")
+    components.html(KANGAROO_GAME_HTML, height=310, scrolling=False)
 
-    # Automatic Game Loop if playing
-    if st.session_state.playing and not engine.game_over:
-        time.sleep(0.04) # ~25 FPS
-        engine.update(dt=1.0)
-        st.rerun()
+    # Leaderboard section
+    st.markdown("---")
+    st.subheader("Leaderboard")
+    scores = score_manager.load_scores()
+    if scores:
+        st.dataframe(scores, use_container_width=True)
+    else:
+        st.info(
+            "No scores recorded yet! Play the game, achieve a high score, "
+            "and record it using the sidebar form."
+        )
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
