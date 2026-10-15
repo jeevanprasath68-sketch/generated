@@ -1,6 +1,6 @@
 # Generated Application
 
-**Requirement:** Build a classical snake with well working controls from the keyboard and well visually understoobd by humans through the app and dont forget to make snake move without commands but also responds when command is given through arrows
+**Requirement:** Build a classical snake with well working controls from the keyboard and well visually understoobd by humans through the app and dont forget to make snake move without commands but also responds when command is given through arrows and make sure keyboard controls work
 
 **Format:** Streamlit Web App
 

@@ -1,26 +1,13 @@
-import streamlit as st
 import random
 import time
-import json
-from typing import List, Tuple, Dict, Any
-from enum import Enum
+from typing import List, Tuple
+import streamlit as st
+import streamlit.components.v1 as components
 
-# --- DOMAIN MODELS & BUSINESS LOGIC ---
+GRID_SIZE = 20
 
-class Direction(Enum):
-    UP = (0, -1)
-    DOWN = (0, 1)
-    LEFT = (-1, 0)
-    RIGHT = (1, 0)
-
-class GameStatus(Enum):
-    IDLE = "IDLE"
-    RUNNING = "RUNNING"
-    PAUSED = "PAUSED"
-    GAME_OVER = "GAME_OVER"
-
-class SnakeGameEngine:
-    def __init__(self, width: int = 20, height: int = 20):
+class SnakeGame:
+    def __init__(self, width: int = GRID_SIZE, height: int = GRID_SIZE):
         self.width = width
         self.height = height
         self.reset()
@@ -28,235 +15,161 @@ class SnakeGameEngine:
     def reset(self):
         self.snake: List[Tuple[int, int]] = [
             (self.width // 2, self.height // 2),
-            (self.width // 2 - 1, self.height // 2),
-            (self.width // 2 - 2, self.height // 2)
+            (self.width // 2, self.height // 2 + 1),
+            (self.width // 2, self.height // 2 + 2)
         ]
-        self.direction = Direction.RIGHT
-        self.next_direction = Direction.RIGHT
-        self.food = self._spawn_food()
+        self.direction = "UP"
+        self.next_direction = "UP"
         self.score = 0
-        self.status = GameStatus.IDLE
+        self.game_over = False
+        self.spawn_food()
 
-    def _spawn_food(self) -> Tuple[int, int]:
+    def spawn_food(self):
         while True:
             fx = random.randint(0, self.width - 1)
             fy = random.randint(0, self.height - 1)
             if (fx, fy) not in self.snake:
-                return (fx, fy)
+                self.food = (fx, fy)
+                break
 
-    def change_direction(self, new_dir: Direction):
-        # Prevent 180-degree immediate turns
-        curr_v = self.direction.value
-        new_v = new_dir.value
-        if curr_v[0] + new_v[0] != 0 or curr_v[1] + new_v[1] != 0:
+    def change_direction(self, new_dir: str):
+        opposites = {"UP": "DOWN", "DOWN": "UP", "LEFT": "RIGHT", "RIGHT": "LEFT"}
+        if new_dir in opposites and opposites[new_dir] != self.next_direction:
             self.next_direction = new_dir
 
     def step(self):
-        if self.status != GameStatus.RUNNING:
+        if self.game_over:
             return
 
         self.direction = self.next_direction
-        head_x, head_y = self.snake[0]
-        dx, dy = self.direction.value
-        new_head = (head_x + dx, head_y + dy)
+        hx, hy = self.snake[0]
+
+        if self.direction == "UP":
+            ny = hy - 1
+            nx = hx
+        elif self.direction == "DOWN":
+            ny = hy + 1
+            nx = hx
+        elif self.direction == "LEFT":
+            nx = hx - 1
+            ny = hy
+        elif self.direction == "RIGHT":
+            nx = hx + 1
+            ny = hy
+        else:
+            nx, ny = hx, hy
 
         # Wall collision
-        if not (0 <= new_head[0] < self.width and 0 <= new_head[1] < self.height):
-            self.status = GameStatus.GAME_OVER
+        if nx < 0 or nx >= self.width or ny < 0 or ny >= self.height:
+            self.game_over = True
             return
 
         # Self collision
-        if new_head in self.snake:
-            self.status = GameStatus.GAME_OVER
+        if (nx, ny) in self.snake:
+            self.game_over = True
             return
 
+        new_head = (nx, ny)
         self.snake.insert(0, new_head)
 
         # Food collision
         if new_head == self.food:
             self.score += 10
-            self.food = self._spawn_food()
+            self.spawn_food()
         else:
             self.snake.pop()
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "width": self.width,
-            "height": self.height,
-            "snake": self.snake,
-            "food": self.food,
-            "score": self.score,
-            "status": self.status.value,
-            "direction": self.direction.name
-        }
-
-# --- STREAMLIT WEB INTERFACE ---
-
-def main():
-    st.set_page_config(
-        page_title="Classic Snake Game - Streamlit",
-        page_icon="🐍",
-        layout="centered"
-    )
-
-    st.title("🐍 Classic Snake Game in Streamlit")
-    st.markdown(
-        """
-        Use the **Arrow Keys** (or **W, A, S, D**) on your keyboard to control the snake.
-        Make sure you click inside the game canvas area or use the control buttons below if needed.
-        """
-    )
-
-    # Initialize session state for game engine
-    if "engine" not in st.session_state:
-        st.session_state.engine = SnakeGameEngine(width=20, height=20)
-        st.session_state.speed = 0.15
-
-    engine: SnakeGameEngine = st.session_state.engine
-
-    # Sidebar controls
-    with st.sidebar:
-        st.header("⚙️ Game Controls")
-        
-        speed_option = st.selectbox("Difficulty / Speed", ["Easy", "Normal", "Hard", "Expert"], index=1)
-        speed_map = {"Easy": 0.25, "Normal": 0.15, "Hard": 0.09, "Expert": 0.05}
-        st.session_state.speed = speed_map[speed_option]
-
-        st.markdown("---")
-        
-        col_btn1, col_btn2 = st.columns(2)
-        with col_btn1:
-            if st.button("▶️ Start / Resume", use_container_width=True):
-                if engine.status in [GameStatus.IDLE, GameStatus.PAUSED, GameStatus.GAME_OVER]:
-                    if engine.status == GameStatus.GAME_OVER:
-                        engine.reset()
-                    engine.status = GameStatus.RUNNING
-                    st.rerun()
-        with col_btn2:
-            if st.button("⏸️ Pause", use_container_width=True):
-                if engine.status == GameStatus.RUNNING:
-                    engine.status = GameStatus.PAUSED
-                    st.rerun()
-
-        if st.button("🔄 Reset Game", use_container_width=True):
-            engine.reset()
-            st.rerun()
-
-        st.markdown("---")
-        st.markdown("### 🏆 Scorecard")
-        st.metric(label="Current Score", value=engine.score)
-        st.metric(label="Status", value=engine.status.value)
-
-    # Handle directional button clicks from UI fallback if keyboard isn't preferred
-    col_c1, col_c2, col_c3 = st.columns([1, 1, 1])
-    with col_c2:
-        sub_c1, sub_c2, sub_c3 = st.columns(3)
-        with sub_c2:
-            if st.button("⬆️"):
-                engine.change_direction(Direction.UP)
-        sub_c1, sub_c2, sub_c3 = st.columns(3)
-        with sub_c1:
-            if st.button("⬅️"):
-                engine.change_direction(Direction.LEFT)
-        with sub_c2:
-            if st.button("⬇️"):
-                engine.change_direction(Direction.DOWN)
-        with sub_c3:
-            if st.button("➡️"):
-                engine.change_direction(Direction.RIGHT)
-
-    # Render HTML Canvas for game grid
-    grid_html = render_game_grid(engine)
-    st.markdown(grid_html, unsafe_allow_html=True)
-
-    # JavaScript keyboard event bridge
-    js_code = """
-    <script>
-    const doc = window.parent.document;
+def get_board_html(game: SnakeGame) -> str:
+    cell_size = 20
+    board_width = game.width * cell_size
+    board_height = game.height * cell_size
     
-    window.addEventListener('keydown', function(e) {
-        if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight', ' '].indexOf(e.key) > -1) {
-            e.preventDefault();
-        }
-    }, false);
+    cells_html = ""
+    for y in range(game.height):
+        for x in range(game.width):
+            pos = (x, y)
+            bg = "#1e1e1e"
+            if pos == game.food:
+                bg = "#ff5252"
+            elif pos == game.snake[0]:
+                bg = "#4caf50"
+            elif pos in game.snake:
+                bg = "#81c784"
+            cells_html += f'<div style="position:absolute; left:{x*cell_size}px; top:{y*cell_size}px; width:{cell_size-1}px; height:{cell_size-1}px; background:{bg}; border-radius:3px;"></div>'
 
-    doc.addEventListener('keydown', function(e) {
-        const key = e.key;
-        let btnText = '';
-        if (key === 'ArrowUp' || key === 'w' || key === 'W') btnText = '⬆️';
-        if (key === 'ArrowDown' || key === 's' || key === 'S') btnText = '⬇️';
-        if (key === 'ArrowLeft' || key === 'a' || key === 'A') btnText = '⬅️';
-        if (key === 'ArrowRight' || key === 'd' || key === 'D') btnText = '➡️';
-
-        if (btnText !== '') {
-            const buttons = doc.querySelectorAll('button');
-            for (let b of buttons) {
-                if (b.innerText.includes(btnText)) {
-                    b.click();
-                    break;
-                }
-            }
-        }
-    });
+    html_code = f"""
+    <div id="game-container" tabindex="0" style="width: {board_width}px; height: {board_height}px; position: relative; background: #121212; border: 2px solid #333; outline: none; margin: 0 auto; border-radius: 6px;">
+        {cells_html}
+    </div>
+    <script>
+        const container = document.getElementById('game-container');
+        container.focus();
+        window.addEventListener('keydown', function(e) {{
+            if(["Space","ArrowUp","ArrowDown","ArrowLeft","ArrowRight"].indexOf(e.code) > -1) {{
+                e.preventDefault();
+            }}
+            let dir = "";
+            if (e.key === "ArrowUp" || e.key === "w") dir = "UP";
+            if (e.key === "ArrowDown" || e.key === "s") dir = "DOWN";
+            if (e.key === "ArrowLeft" || e.key === "a") dir = "LEFT";
+            if (e.key === "ArrowRight" || e.key === "d") dir = "RIGHT";
+            
+            if (dir !== "") {{
+                window.parent.postMessage({{type: 'streamlit:setComponentValue', value: dir}}, '*');
+            }}
+        }});
     </script>
     """
-    st.components.v1.html(js_code, height=0)
+    return html_code
 
-    # Game loop handling
-    if engine.status == GameStatus.RUNNING:
-        time.sleep(st.session_state.speed)
-        engine.step()
+def main():
+    st.set_page_config(page_title="Streamlit Snake Game", page_icon="🐍", layout="centered")
+    
+    st.title("🐍 Classical Streamlit Snake Game")
+    st.markdown("Use your **Arrow Keys** or **W, A, S, D** to control the snake. Eat red food to grow and score points! Avoid walls and yourself.")
+
+    if "game" not in st.session_state:
+        st.session_state.game = SnakeGame()
+
+    game: SnakeGame = st.session_state.game
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Score", game.score)
+    col2.metric("Status", "Game Over 💀" if game.game_over else "Playing 🚀")
+    col3.metric("Snake Length", len(game.snake))
+
+    # Render keyboard component
+    component_value = components.html(get_board_html(game), height=420, scrolling=False)
+
+    # Control buttons fallback / manual triggers
+    st.markdown("### Manual Controls")
+    b1, b2, b3, b4 = st.columns(4)
+    if b1.button("⬆️ Up"):
+        game.change_direction("UP")
+        game.step()
+        st.rerun()
+    if b2.button("⬇️ Down"):
+        game.change_direction("DOWN")
+        game.step()
+        st.rerun()
+    if b3.button("⬅️ Left"):
+        game.change_direction("LEFT")
+        game.step()
+        st.rerun()
+    if b4.button("➡️ Right"):
+        game.change_direction("RIGHT")
+        game.step()
         st.rerun()
 
-def render_game_grid(engine: SnakeGameEngine) -> str:
-    cell_size = 22
-    width_px = engine.width * cell_size
-    height_px = engine.height * cell_size
+    c_reset, c_step = st.columns(2)
+    if c_reset.button("🔄 Reset Game"):
+        game.reset()
+        st.rerun()
 
-    board = [[ "empty" for _ in range(engine.width)] for _ in range(engine.height)]
-    
-    # Mark food
-    fx, fy = engine.food
-    board[fy][fx] = "food"
-
-    # Mark snake
-    for i, (sx, sy) in enumerate(engine.snake):
-        if 0 <= sx < engine.width and 0 <= sy < engine.height:
-            board[sy][sx] = "head" if i == 0 else "body"
-
-    css = """
-    <style>
-    .snake-board {
-        display: grid;
-        grid-template-columns: repeat(%d, %dpx);
-        grid-template-rows: repeat(%d, %dpx);
-        gap: 1px;
-        background-color: #1e1e1e;
-        padding: 10px;
-        border-radius: 10px;
-        width: fit-content;
-        margin: 0 auto;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-    }
-    .snake-cell {
-        width: %dpx;
-        height: %dpx;
-        border-radius: 3px;
-    }
-    .cell-empty { background-color: #2d2d2d; }
-    .cell-head { background-color: #4CAF50; border: 1px solid #81C784; }
-    .cell-body { background-color: #81C784; }
-    .cell-food { background-color: #FF5252; border-radius: 50%%; }
-    </style>
-    <div class="snake-board">
-    """ % (engine.width, cell_size, engine.height, cell_size, cell_size, cell_size)
-
-    for row in board:
-        for cell in row:
-            css += f'<div class="snake-cell cell-{cell}"></div>'
-
-    css += "</div>"
-    return css
+    if not game.game_over:
+        if c_step.button("⏩ Step Forward"):
+            game.step()
+            st.rerun()
 
 if __name__ == "__main__":
     main()
