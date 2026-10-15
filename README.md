@@ -1,6 +1,6 @@
 # Generated Application
 
-**Requirement:** build the classical snake game and make sure it is visually playable by the humans and check if all the controls are working fine
+**Requirement:** Build a classical snake with well working controls from the keyboard and well visually understoobd by humans through the app
 
 **Format:** Streamlit Web App
 
