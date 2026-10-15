@@ -1,497 +1,623 @@
-import re
-from typing import Any, Dict, List, Tuple, Union
-import numpy as np
-import sympy as sp
+"""SpendWise — Student Expense & Budget Manager.
+
+A complete personal finance manager built with Streamlit, SQLite, Pandas, and Plotly.
+"""
+
+import sqlite3
+from datetime import datetime, date
+from typing import List, Dict, Any, Optional, Tuple
+import io
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
+# =====================================================================
+# CONSTANTS & CONFIGURATION
+# =====================================================================
+CATEGORIES: List[str] = ["Food", "Transport", "Education", "Shopping", "Entertainment", "Other"]
+PAYMENT_METHODS: List[str] = ["Cash", "Debit Card", "Credit Card", "UPI / Mobile Payment", "Bank Transfer"]
+DEFAULT_DB_PATH = "spendwise.db"
+
 
 # =====================================================================
-# 1. CORE BUSINESS LOGIC
+# DATABASE & STORAGE LAYER
 # =====================================================================
+class ExpenseDB:
+    """Handles SQLite database operations for expenses and monthly budgets."""
 
-class MathEvaluator:
-    """Safe evaluation of basic and scientific mathematical expressions."""
+    def __init__(self, db_path: str = DEFAULT_DB_PATH):
+        self.db_path = db_path
+        self.init_db()
 
-    ALLOWED_NAMES: Dict[str, Any] = {
-        "sin": sp.sin,
-        "cos": sp.cos,
-        "tan": sp.tan,
-        "sqrt": sp.sqrt,
-        "log": sp.log,
-        "ln": sp.log,
-        "exp": sp.exp,
-        "abs": sp.Abs,
-        "pi": sp.pi,
-        "e": sp.E,
-        "factorial": sp.factorial,
-    }
+    def get_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
 
-    @classmethod
-    def evaluate(cls, expression: str) -> Tuple[float, str]:
-        """Parses and evaluates a mathematical string into numerical float and exact form."""
-        if not expression or not expression.strip():
-            raise ValueError("Expression cannot be empty.")
+    def init_db(self) -> None:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS expenses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    amount REAL NOT NULL,
+                    category TEXT NOT NULL,
+                    expense_date TEXT NOT NULL,
+                    payment_method TEXT NOT NULL,
+                    description TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS budgets (
+                    month_year TEXT PRIMARY KEY,
+                    amount REAL NOT NULL
+                )
+                """
+            )
+            conn.commit()
 
-        clean_expr = expression.replace("^", "**").strip()
-        # Safety check: allow only digits, basic operators, symbols, dots, parentheses
-        if not re.match(r"^[0-9a-zA-Z_\+\-\*/\^\(\)\.,\s]+$", clean_expr):
-            raise ValueError("Invalid characters detected in expression.")
+    def add_expense(self, amount: float, category: str, expense_date: str, payment_method: str, description: str) -> int:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO expenses (amount, category, expense_date, payment_method, description)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (amount, category, expense_date, payment_method, description.strip())
+            )
+            conn.commit()
+            return cursor.lastrowid
 
+    def update_expense(self, expense_id: int, amount: float, category: str, expense_date: str, payment_method: str, description: str) -> bool:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE expenses
+                SET amount = ?, category = ?, expense_date = ?, payment_method = ?, description = ?
+                WHERE id = ?
+                """,
+                (amount, category, expense_date, payment_method, description.strip(), expense_id)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_expense(self, expense_id: int) -> bool:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def get_expense_by_id(self, expense_id: int) -> Optional[Dict[str, Any]]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM expenses WHERE id = ?", (expense_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_all_expenses(self) -> List[Dict[str, Any]]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM expenses ORDER BY expense_date DESC, id DESC")
+            rows = cursor.fetchall()
+            return [dict(r) for r in rows]
+
+    def set_budget(self, month_year: str, amount: float) -> None:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO budgets (month_year, amount)
+                VALUES (?, ?)
+                ON CONFLICT(month_year) DO UPDATE SET amount=excluded.amount
+                """,
+                (month_year, amount)
+            )
+            conn.commit()
+
+    def get_budget(self, month_year: str) -> float:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT amount FROM budgets WHERE month_year = ?", (month_year,))
+            row = cursor.fetchone()
+            return float(row["amount"]) if row else 0.0
+
+
+# =====================================================================
+# BUSINESS LOGIC & ANALYTICS LAYER
+# =====================================================================
+class ExpenseValidator:
+    """Validates form fields and parameters."""
+
+    @staticmethod
+    def validate_amount(amount: Any) -> float:
         try:
-            parsed = sp.sympify(clean_expr, locals=cls.ALLOWED_NAMES)
-            numerical_val = float(parsed.evalf())
-            exact_str = str(parsed)
-            return numerical_val, exact_str
-        except Exception as e:
-            raise ValueError(f"Could not evaluate expression: {e}") from e
-
-
-class EquationSolver:
-    """Solves algebraic equations and systems of equations symbolically."""
+            val = float(amount)
+            if val <= 0:
+                raise ValueError("Amount must be strictly greater than 0.")
+            return round(val, 2)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid amount: {exc}") from exc
 
     @staticmethod
-    def solve_single(eq_string: str, var_name: str = "x") -> List[str]:
-        """Solves an equation like 'x**2 - 4 = 0' or '2*x + 5 = 15'."""
-        if not eq_string or not eq_string.strip():
-            raise ValueError("Equation string cannot be empty.")
-
-        clean_eq = eq_string.replace("^", "**").strip()
-        var = sp.Symbol(var_name)
-
-        if "=" in clean_eq:
-            parts = clean_eq.split("=")
-            if len(parts) != 2:
-                raise ValueError("Equation must have exactly one '=' sign.")
-            lhs = sp.sympify(parts[0])
-            rhs = sp.sympify(parts[1])
-            target_eq = sp.Eq(lhs, rhs)
-        else:
-            target_eq = sp.Eq(sp.sympify(clean_eq), 0)
-
-        solutions = sp.solve(target_eq, var)
-        return [str(sol) for sol in solutions]
+    def validate_date(date_str: str) -> str:
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            return dt.strftime("%Y-%m-%d")
+        except Exception as exc:
+            raise ValueError(f"Invalid date format (must be YYYY-MM-DD): {date_str}") from exc
 
     @staticmethod
-    def solve_linear_system(eqs: List[str], vars_list: List[str]) -> Dict[str, str]:
-        """Solves a system of equations given a list of equation strings and variables."""
-        if not eqs or not vars_list:
-            raise ValueError("Equations and variables cannot be empty.")
-
-        symbols = [sp.Symbol(v.strip()) for v in vars_list]
-        parsed_eqs = []
-        for eq_str in eqs:
-            eq_clean = eq_str.replace("^", "**").strip()
-            if "=" in eq_clean:
-                lhs, rhs = eq_clean.split("=", 1)
-                parsed_eqs.append(sp.Eq(sp.sympify(lhs), sp.sympify(rhs)))
-            else:
-                parsed_eqs.append(sp.Eq(sp.sympify(eq_clean), 0))
-
-        solution = sp.solve(parsed_eqs, symbols, dict=True)
-        if not solution:
-            return {}
-        
-        res = {}
-        for sym in symbols:
-            if sym in solution[0]:
-                res[str(sym)] = str(solution[0][sym])
-        return res
+    def validate_category(cat: str) -> str:
+        if not cat or cat.strip() not in CATEGORIES:
+            raise ValueError(f"Category must be one of {CATEGORIES}")
+        return cat.strip()
 
 
-class UnitConverter:
-    """Handles dimensional analysis and unit conversions across standard metrics."""
-
-    CONVERSIONS: Dict[str, Dict[str, float]] = {
-        "Length/Height": {
-            "m": 1.0,
-            "km": 1000.0,
-            "cm": 0.01,
-            "mm": 0.001,
-            "inch": 0.0254,
-            "ft": 0.3048,
-            "yard": 0.9144,
-            "mile": 1609.344,
-        },
-        "Area": {
-            "sq_m": 1.0,
-            "sq_km": 1_000_000.0,
-            "sq_cm": 0.0001,
-            "sq_ft": 0.09290304,
-            "sq_yd": 0.83612736,
-            "acre": 4046.8564224,
-            "hectare": 10000.0,
-        },
-        "Volume": {
-            "cu_m": 1.0,
-            "liter": 0.001,
-            "ml": 0.000001,
-            "cu_ft": 0.028316846592,
-            "gallon_us": 0.003785411784,
-            "quart_us": 0.000946352946,
-        },
-        "Mass": {
-            "kg": 1.0,
-            "g": 0.001,
-            "mg": 0.000001,
-            "lb": 0.45359237,
-            "oz": 0.028349523125,
-            "tonne": 1000.0,
-        },
-    }
-
-    @classmethod
-    def convert(cls, value: float, category: str, from_unit: str, to_unit: str) -> float:
-        if category == "Temperature":
-            return cls._convert_temperature(value, from_unit, to_unit)
-
-        if category not in cls.CONVERSIONS:
-            raise ValueError(f"Unsupported category: {category}")
-
-        cat_units = cls.CONVERSIONS[category]
-        if from_unit not in cat_units or to_unit not in cat_units:
-            raise ValueError(f"Units must be in {list(cat_units.keys())}")
-
-        # Convert to base unit then to target unit
-        base_val = value * cat_units[from_unit]
-        return base_val / cat_units[to_unit]
+class AnalyticsEngine:
+    """Performs aggregations, metrics computations, and filtering on expense data."""
 
     @staticmethod
-    def _convert_temperature(value: float, from_unit: str, to_unit: str) -> float:
-        units = {"Celsius", "Fahrenheit", "Kelvin"}
-        if from_unit not in units or to_unit not in units:
-            raise ValueError(f"Temperature unit must be one of {units}")
+    def filter_and_sort(
+        df: pd.DataFrame,
+        search_query: str = "",
+        categories: Optional[List[str]] = None,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        sort_by: str = "Date",
+        sort_order: str = "Descending",
+    ) -> pd.DataFrame:
+        if df.empty:
+            return df
 
-        # Standardize to Celsius
-        if from_unit == "Celsius":
-            c = value
-        elif from_unit == "Fahrenheit":
-            c = (value - 32.0) * 5.0 / 9.0
-        else:  # Kelvin
-            c = value - 273.15
+        res = df.copy()
+        res["expense_date_dt"] = pd.to_datetime(res["expense_date"]).dt.date
 
-        # Convert to target
-        if to_unit == "Celsius":
-            return c
-        elif to_unit == "Fahrenheit":
-            return (c * 9.0 / 5.0) + 32.0
-        else:  # Kelvin
-            return c + 273.15
+        if start_date:
+            res = res[res["expense_date_dt"] >= start_date]
+        if end_date:
+            res = res[res["expense_date_dt"] <= end_date]
 
+        if categories:
+            res = res[res["category"].isin(categories)]
 
-class MatrixEngine:
-    """Linear algebra engine including matrix solving and 1D/2D convolution."""
+        if search_query.strip():
+            q = search_query.strip().lower()
+            desc_match = res["description"].fillna("").str.lower().str.contains(q)
+            cat_match = res["category"].fillna("").str.lower().str.contains(q)
+            method_match = res["payment_method"].fillna("").str.lower().str.contains(q)
+            res = res[desc_match | cat_match | method_match]
 
-    @staticmethod
-    def add(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        return np.add(a, b)
+        ascending = (sort_order == "Ascending")
+        if sort_by == "Amount":
+            res = res.sort_values(by="amount", ascending=ascending)
+        elif sort_by == "Date":
+            res = res.sort_values(by="expense_date_dt", ascending=ascending)
+        elif sort_by == "Category":
+            res = res.sort_values(by="category", ascending=ascending)
 
-    @staticmethod
-    def subtract(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        return np.subtract(a, b)
-
-    @staticmethod
-    def multiply(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        return np.matmul(a, b)
-
-    @staticmethod
-    def transpose(a: np.ndarray) -> np.ndarray:
-        return np.transpose(a)
-
-    @staticmethod
-    def determinant(a: np.ndarray) -> float:
-        if a.shape[0] != a.shape[1]:
-            raise ValueError("Determinant requires a square matrix.")
-        return float(np.linalg.det(a))
+        return res.drop(columns=["expense_date_dt"], errors="ignore")
 
     @staticmethod
-    def inverse(a: np.ndarray) -> np.ndarray:
-        if a.shape[0] != a.shape[1]:
-            raise ValueError("Inverse requires a square matrix.")
-        det = np.linalg.det(a)
-        if np.isclose(det, 0.0):
-            raise ValueError("Matrix is singular and non-invertible.")
-        return np.linalg.inv(a)
+    def calculate_budget_summary(df: pd.DataFrame, target_month_year: str, monthly_budget: float) -> Dict[str, Any]:
+        if df.empty:
+            return {
+                "total_spent": 0.0,
+                "budget": monthly_budget,
+                "remaining": monthly_budget,
+                "percentage_used": 0.0,
+                "status": "On Track",
+            }
+
+        df_copy = df.copy()
+        df_copy["month_year"] = pd.to_datetime(df_copy["expense_date"]).dt.strftime("%Y-%m")
+        month_data = df_copy[df_copy["month_year"] == target_month_year]
+
+        total_spent = float(month_data["amount"].sum())
+        remaining = monthly_budget - total_spent
+        percentage_used = (total_spent / monthly_budget * 100.0) if monthly_budget > 0 else 0.0
+
+        status = "On Track"
+        if monthly_budget > 0:
+            if total_spent > monthly_budget:
+                status = "Over Budget"
+            elif total_spent >= 0.85 * monthly_budget:
+                status = "Warning (>85%)"
+
+        return {
+            "total_spent": round(total_spent, 2),
+            "budget": round(monthly_budget, 2),
+            "remaining": round(remaining, 2),
+            "percentage_used": round(percentage_used, 1),
+            "status": status,
+        }
 
     @staticmethod
-    def solve_linear(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        """Solves Ax = b."""
-        if a.shape[0] != a.shape[1]:
-            raise ValueError("Matrix A must be square to solve Ax = b.")
-        if np.isclose(np.linalg.det(a), 0.0):
-            raise ValueError("Matrix A is singular; no unique solution.")
-        return np.linalg.solve(a, b)
+    def category_breakdown(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return pd.DataFrame(columns=["category", "amount", "percentage"])
+        grouped = df.groupby("category")["amount"].sum().reset_index()
+        total = grouped["amount"].sum()
+        grouped["percentage"] = (grouped["amount"] / total * 100).round(1) if total > 0 else 0.0
+        return grouped.sort_values(by="amount", ascending=False)
 
     @staticmethod
-    def convolve_1d(signal: np.ndarray, kernel: np.ndarray, mode: str = "full") -> np.ndarray:
-        """Computes 1D discrete convolution."""
-        if signal.ndim != 1 or kernel.ndim != 1:
-            raise ValueError("Signal and kernel must both be 1-dimensional.")
-        if len(signal) == 0 or len(kernel) == 0:
-            raise ValueError("Arrays cannot be empty.")
-        return np.convolve(signal, kernel, mode=mode)
+    def monthly_trend(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return pd.DataFrame(columns=["month_year", "amount"])
+        df_copy = df.copy()
+        df_copy["month_year"] = pd.to_datetime(df_copy["expense_date"]).dt.strftime("%Y-%m")
+        grouped = df_copy.groupby("month_year")["amount"].sum().reset_index()
+        return grouped.sort_values(by="month_year")
 
-    @staticmethod
-    def convolve_2d(matrix: np.ndarray, kernel: np.ndarray, mode: str = "same") -> np.ndarray:
-        """Pure NumPy 2D convolution supporting 'full', 'valid', and 'same' modes."""
-        if matrix.ndim != 2 or kernel.ndim != 2:
-            raise ValueError("Matrix and kernel must both be 2-dimensional.")
 
-        m_h, m_w = matrix.shape
-        k_h, k_w = kernel.shape
-        if m_h == 0 or m_w == 0 or k_h == 0 or k_w == 0:
-            raise ValueError("Matrix dimensions must be non-zero.")
-
-        # Rotate kernel 180 degrees for true convolution
-        k_flipped = np.flipud(np.fliplr(kernel))
-
-        if mode == "full":
-            pad_h, pad_w = k_h - 1, k_w - 1
-            padded = np.pad(matrix, ((pad_h, pad_h), (pad_w, pad_w)), mode="constant")
-            out_h = m_h + k_h - 1
-            out_w = m_w + k_w - 1
-            out = np.zeros((out_h, out_w), dtype=float)
-            for i in range(out_h):
-                for j in range(out_w):
-                    out[i, j] = np.sum(padded[i : i + k_h, j : j + k_w] * k_flipped)
-            return out
-
-        elif mode == "valid":
-            if m_h < k_h or m_w < k_w:
-                raise ValueError("Matrix dimensions must be >= kernel dimensions for 'valid' mode.")
-            out_h = m_h - k_h + 1
-            out_w = m_w - k_w + 1
-            out = np.zeros((out_h, out_w), dtype=float)
-            for i in range(out_h):
-                for j in range(out_w):
-                    out[i, j] = np.sum(matrix[i : i + k_h, j : j + k_w] * k_flipped)
-            return out
-
-        elif mode == "same":
-            pad_top = k_h // 2
-            pad_bottom = k_h - 1 - pad_top
-            pad_left = k_w // 2
-            pad_right = k_w - 1 - pad_left
-            padded = np.pad(matrix, ((pad_top, pad_bottom), (pad_left, pad_right)), mode="constant")
-            out = np.zeros((m_h, m_w), dtype=float)
-            for i in range(m_h):
-                for j in range(m_w):
-                    out[i, j] = np.sum(padded[i : i + k_h, j : j + k_w] * k_flipped)
-            return out
-
-        else:
-            raise ValueError("Mode must be 'full', 'valid', or 'same'.")
+def export_dataframe_to_csv(df: pd.DataFrame) -> str:
+    if df.empty:
+        return "id,amount,category,expense_date,payment_method,description\n"
+    clean_df = df.drop(columns=["created_at"], errors="ignore")
+    return clean_df.to_csv(index=False)
 
 
 # =====================================================================
-# 2. STREAMLIT USER INTERFACE
+# STREAMLIT UI PRESENTATION LAYER
 # =====================================================================
-
-def parse_matrix_input(text: str) -> np.ndarray:
-    """Converts multiline string of numbers into a 2D numpy array."""
-    lines = [line.strip() for line in text.strip().split("\n") if line.strip()]
-    if not lines:
-        raise ValueError("Matrix input cannot be empty.")
-    data = [[float(val.strip()) for val in re.split(r"[,\s]+", line)] for line in lines]
-    # Check equal length rows
-    row_lens = {len(r) for r in data}
-    if len(row_lens) > 1:
-        raise ValueError("All rows in the matrix must have the same number of columns.")
-    return np.array(data, dtype=float)
+def init_session_state(db: ExpenseDB):
+    if "db" not in st.session_state:
+        st.session_state.db = db
+    if "edit_id" not in st.session_state:
+        st.session_state.edit_id = None
 
 
 def render_ui():
-    st.set_page_config(page_title="OmniCalc Pro & Matrix Engine", page_icon="🧮", layout="wide")
-    st.title("🧮 OmniCalc Pro & Matrix Engine")
-    st.caption("Basic & Scientific Math, Symbolic Equations, Metric Converter, Linear Algebra & Convolution")
+    st.set_page_config(
+        page_title="SpendWise — Student Budget Manager",
+        page_icon="💳",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
 
-    tabs = st.tabs([
-        "🔢 Math Calculator",
-        "📐 Equation Solver",
-        "🔄 Metric Converter",
-        "🔳 Matrix & Convolution"
-    ])
+    st.markdown(
+        """
+        <style>
+        .main { background-color: #0E1117; color: #FAFAFA; }
+        .metric-card {
+            background: linear-gradient(135deg, #1E2638 0%, #151A24 100%);
+            border: 1px solid #2D3748;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 15px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2);
+        }
+        .metric-label {
+            font-size: 0.85rem;
+            color: #A0AEC0;
+            margin-bottom: 6px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .metric-value {
+            font-size: 1.85rem;
+            font-weight: 700;
+            color: #F7FAFC;
+        }
+        .status-badge {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            margin-top: 8px;
+        }
+        .badge-safe { background-color: #22543D; color: #9AE6B4; }
+        .badge-warn { background-color: #744210; color: #FEEBC8; }
+        .badge-danger { background-color: #742A2A; color: #FEB2B2; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    # TAB 1: MATH CALCULATOR
-    with tabs[0]:
-        st.header("Basic & Scientific Math")
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            expr = st.text_input("Enter expression:", value="sqrt(16) + 3^2 * cos(pi/3)")
-            if st.button("Calculate Expression", key="btn_eval"):
-                try:
-                    val, exact = MathEvaluator.evaluate(expr)
-                    st.success(f"Result: **{val}**")
-                    st.info(f"Exact symbolic representation: `{exact}`")
-                except Exception as ex:
-                    st.error(str(ex))
-        with col2:
-            st.markdown("**Supported Operations:**")
-            st.code("+, -, *, /, ^, sqrt(), log(), sin(), cos(), tan(), abs(), pi, e, factorial()")
+    db = ExpenseDB()
+    init_session_state(db)
 
-    # TAB 2: EQUATION SOLVER
-    with tabs[1]:
-        st.header("Symbolic Equation Solver")
-        eq_mode = st.radio("Solver Mode", ["Single Variable", "System of Linear Equations"], horizontal=True)
+    st.sidebar.title("💳 SpendWise")
+    st.sidebar.caption("Smart Student Expense & Budget Tracker")
+    st.sidebar.divider()
 
-        if eq_mode == "Single Variable":
-            eq_input = st.text_input("Equation (e.g. 2*x^2 - 8 = 0 or 3*x + 5 = 20):", value="x^2 - 5*x + 6 = 0")
-            var_sym = st.text_input("Variable to solve for:", value="x")
-            if st.button("Solve Equation", key="btn_eq_single"):
-                try:
-                    roots = EquationSolver.solve_single(eq_input, var_sym)
-                    st.write(f"Found **{len(roots)}** solution(s):" if roots else "No solutions found.")
-                    for idx, root in enumerate(roots, 1):
-                        st.latex(f"{var_sym}_{{{idx}}} = {root}")
-                except Exception as ex:
-                    st.error(str(ex))
-        else:
-            st.markdown("Enter linear equations separated by newlines:")
-            eq_sys = st.text_area("Equations:", value="2*x + y = 10\nx - y = 2", height=100)
-            sys_vars = st.text_input("Variables (comma-separated):", value="x, y")
-            if st.button("Solve System", key="btn_eq_sys"):
-                try:
-                    v_list = [v.strip() for v in sys_vars.split(",")]
-                    eqs_list = [l.strip() for l in eq_sys.split("\n") if l.strip()]
-                    results = EquationSolver.solve_linear_system(eqs_list, v_list)
-                    if results:
-                        st.success("Solution found:")
-                        for k, v in results.items():
-                            st.latex(f"{k} = {v}")
-                    else:
-                        st.warning("No unique solution found or system is inconsistent.")
-                except Exception as ex:
-                    st.error(str(ex))
+    current_ym = datetime.today().strftime("%Y-%m")
+    view_selection = st.sidebar.radio(
+        "Navigation",
+        ["📊 Dashboard", "➕ Add & Edit Expenses", "📑 Expense History & Export", "⚙️ Budget Settings"],
+    )
 
-    # TAB 3: METRIC CONVERTER
-    with tabs[2]:
-        st.header("Metric & Imperial Converter")
-        cat = st.selectbox("Category", list(UnitConverter.CONVERSIONS.keys()) + ["Temperature"])
+    expenses = db.get_all_expenses()
+    df_expenses = pd.DataFrame(expenses)
+    current_budget = db.get_budget(current_ym)
 
-        if cat == "Temperature":
-            avail_units = ["Celsius", "Fahrenheit", "Kelvin"]
-        else:
-            avail_units = list(UnitConverter.CONVERSIONS[cat].keys())
+    if view_selection == "📊 Dashboard":
+        st.title("Personal Finance Dashboard")
+        st.caption(f"Overview for current billing period: **{current_ym}**")
 
-        c1, c2, c3 = st.columns(3)
+        summary = AnalyticsEngine.calculate_budget_summary(df_expenses, current_ym, current_budget)
+
+        c1, c2, c3, c4 = st.columns(4)
         with c1:
-            val = st.number_input("Value to Convert", value=100.0, format="%f")
+            st.markdown(
+                f"""<div class="metric-card">
+                    <div class="metric-label">Monthly Budget</div>
+                    <div class="metric-value">${summary['budget']:,.2f}</div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
         with c2:
-            from_u = st.selectbox("From Unit", avail_units, index=0)
+            st.markdown(
+                f"""<div class="metric-card">
+                    <div class="metric-label">Month Spending</div>
+                    <div class="metric-value">${summary['total_spent']:,.2f}</div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
         with c3:
-            to_u = st.selectbox("To Unit", avail_units, index=1 if len(avail_units) > 1 else 0)
+            rem_color = "#FEB2B2" if summary["remaining"] < 0 else "#9AE6B4"
+            st.markdown(
+                f"""<div class="metric-card">
+                    <div class="metric-label">Remaining Budget</div>
+                    <div class="metric-value" style="color: {rem_color};">${summary['remaining']:,.2f}</div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+        with c4:
+            badge_class = "badge-safe"
+            if summary["status"] == "Warning (>85%)":
+                badge_class = "badge-warn"
+            elif summary["status"] == "Over Budget":
+                badge_class = "badge-danger"
 
-        if st.button("Convert Units", key="btn_conv"):
-            try:
-                converted = UnitConverter.convert(val, cat, from_u, to_u)
-                st.metric(label=f"{from_u} -> {to_u}", value=f"{converted:.6g}")
-            except Exception as ex:
-                st.error(str(ex))
+            st.markdown(
+                f"""<div class="metric-card">
+                    <div class="metric-label">Budget Used</div>
+                    <div class="metric-value">{summary['percentage_used']}%</div>
+                    <span class="status-badge {badge_class}">{summary['status']}</span>
+                </div>""",
+                unsafe_allow_html=True,
+            )
 
-    # TAB 4: MATRIX & CONVOLUTION
-    with tabs[3]:
-        st.header("Matrix Calculator & Convolution Engine")
-        m_feature = st.selectbox(
-            "Choose Operation",
-            ["Basic Linear Algebra", "Solve Ax = b", "1D Convolution", "2D Convolution"]
-        )
+        st.divider()
 
-        if m_feature == "Basic Linear Algebra":
-            st.subheader("Matrix Operations")
-            c_a, c_b = st.columns(2)
-            with c_a:
-                raw_a = st.text_area("Matrix A (rows separated by newlines, cols by spaces/commas):", value="1 2\n3 4")
-            with c_b:
-                raw_b = st.text_area("Matrix B (Optional for unary ops):", value="5 6\n7 8")
+        if df_expenses.empty:
+            st.info("No expenses logged yet! Head over to '➕ Add & Edit Expenses' to record your first transaction.")
+        else:
+            g1, g2 = st.columns(2)
 
-            op = st.selectbox("Operation", ["A + B", "A - B", "A * B", "Transpose(A)", "Determinant(A)", "Inverse(A)"])
-            if st.button("Compute", key="btn_mat_basic"):
-                try:
-                    mat_a = parse_matrix_input(raw_a)
-                    if op == "Transpose(A)":
-                        res = MatrixEngine.transpose(mat_a)
-                        st.write("**Result:**"); st.dataframe(res)
-                    elif op == "Determinant(A)":
-                        det = MatrixEngine.determinant(mat_a)
-                        st.metric("Determinant of A", f"{det:.6g}")
-                    elif op == "Inverse(A)":
-                        res = MatrixEngine.inverse(mat_a)
-                        st.write("**Inverse Matrix:**"); st.dataframe(res)
-                    else:
-                        mat_b = parse_matrix_input(raw_b)
-                        if op == "A + B":
-                            res = MatrixEngine.add(mat_a, mat_b)
-                        elif op == "A - B":
-                            res = MatrixEngine.subtract(mat_a, mat_b)
-                        else:
-                            res = MatrixEngine.multiply(mat_a, mat_b)
-                        st.write("**Result:**"); st.dataframe(res)
-                except Exception as ex:
-                    st.error(str(ex))
+            with g1:
+                st.subheader("Spending by Category")
+                cat_df = AnalyticsEngine.category_breakdown(df_expenses)
+                if not cat_df.empty:
+                    fig_pie = px.pie(
+                        cat_df,
+                        names="category",
+                        values="amount",
+                        hole=0.45,
+                        color_discrete_sequence=px.colors.qualitative.Prism,
+                    )
+                    fig_pie.update_layout(
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        font=dict(color="#E2E8F0"),
+                        margin=dict(t=20, b=20, l=20, r=20),
+                    )
+                    st.plotly_chart(fig_pie, use_container_width=True)
+                else:
+                    st.write("No category data available.")
 
-        elif m_feature == "Solve Ax = b":
-            st.subheader("Solve Linear System Ax = b")
-            c_a, c_b = st.columns([2, 1])
-            with c_a:
-                raw_a = st.text_area("Square Matrix A:", value="2 1\n1 3")
-            with c_b:
-                raw_b = st.text_area("Vector b (1D or single column):", value="8\n13")
+            with g2:
+                st.subheader("Monthly Spending Trend")
+                trend_df = AnalyticsEngine.monthly_trend(df_expenses)
+                if not trend_df.empty:
+                    fig_bar = px.bar(
+                        trend_df,
+                        x="month_year",
+                        y="amount",
+                        labels={"month_year": "Month", "amount": "Total Spent ($)"},
+                        color_discrete_sequence=["#6366F1"],
+                    )
+                    fig_bar.update_layout(
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        font=dict(color="#E2E8F0"),
+                        xaxis=dict(gridcolor="#2D3748"),
+                        yaxis=dict(gridcolor="#2D3748"),
+                        margin=dict(t=20, b=20, l=20, r=20),
+                    )
+                    st.plotly_chart(fig_bar, use_container_width=True)
+                else:
+                    st.write("No trend data available.")
 
-            if st.button("Solve System", key="btn_mat_solve"):
-                try:
-                    mat_a = parse_matrix_input(raw_a)
-                    vec_b = parse_matrix_input(raw_b).flatten()
-                    sol = MatrixEngine.solve_linear(mat_a, vec_b)
-                    st.success("Solution Vector x:")
-                    st.dataframe(sol.reshape(-1, 1))
-                except Exception as ex:
-                    st.error(str(ex))
+            st.subheader("Payment Method Distribution")
+            pm_df = df_expenses.groupby("payment_method")["amount"].sum().reset_index()
+            fig_pm = px.bar(
+                pm_df,
+                x="payment_method",
+                y="amount",
+                color="payment_method",
+                labels={"payment_method": "Payment Method", "amount": "Amount ($)"},
+            )
+            fig_pm.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#E2E8F0"),
+                xaxis=dict(gridcolor="#2D3748"),
+                yaxis=dict(gridcolor="#2D3748"),
+                showlegend=False,
+                margin=dict(t=20, b=20, l=20, r=20),
+            )
+            st.plotly_chart(fig_pm, use_container_width=True)
 
-        elif m_feature == "1D Convolution":
-            st.subheader("1D Discrete Convolution")
-            sig_txt = st.text_input("Signal vector (space-separated):", value="1 2 3 4 5")
-            ker_txt = st.text_input("Kernel vector (space-separated):", value="1 0 -1")
-            mode_1d = st.selectbox("Mode", ["full", "same", "valid"])
+    elif view_selection == "➕ Add & Edit Expenses":
+        st.title("Manage Expenses")
 
-            if st.button("Run 1D Convolution", key="btn_conv1d"):
-                try:
-                    sig = np.array([float(x) for x in re.split(r"[,\s]+", sig_txt.strip())])
-                    ker = np.array([float(x) for x in re.split(r"[,\s]+", ker_txt.strip())])
-                    result = MatrixEngine.convolve_1d(sig, ker, mode=mode_1d)
-                    st.write("**Convolved Signal:**")
-                    st.line_chart(result)
-                    st.dataframe(result.reshape(1, -1))
-                except Exception as ex:
-                    st.error(str(ex))
+        is_editing = st.session_state.edit_id is not None
+        edit_data = {}
+        if is_editing:
+            edit_data = db.get_expense_by_id(st.session_state.edit_id) or {}
+            if not edit_data:
+                st.session_state.edit_id = None
+                is_editing = False
 
-        elif m_feature == "2D Convolution":
-            st.subheader("2D Matrix Convolution / Image Filtering")
+        st.subheader("Edit Expense" if is_editing else "Log a New Expense")
+
+        default_amount = float(edit_data.get("amount", 10.0)) if is_editing else 10.0
+        default_cat = edit_data.get("category", CATEGORIES[0]) if is_editing else CATEGORIES[0]
+        default_date = datetime.strptime(edit_data["expense_date"], "%Y-%m-%d").date() if is_editing else date.today()
+        default_method = edit_data.get("payment_method", PAYMENT_METHODS[0]) if is_editing else PAYMENT_METHODS[0]
+        default_desc = edit_data.get("description", "") if is_editing else ""
+
+        with st.form("expense_form", clear_on_submit=not is_editing):
             c1, c2 = st.columns(2)
             with c1:
-                mat_2d_txt = st.text_area("Input Matrix / Image:", value="1 2 3 4\n5 6 7 8\n9 10 11 12\n13 14 15 16")
+                amount_input = st.number_input("Amount ($", min_value=0.01, max_value=100000.0, value=default_amount, step=1.0, format="%.2f")
+                category_input = st.selectbox("Category", CATEGORIES, index=CATEGORIES.index(default_cat) if default_cat in CATEGORIES else 0)
+                date_input = st.date_input("Expense Date", value=default_date)
             with c2:
-                preset = st.selectbox("Preset Kernels", ["Custom", "Sobel Horizontal", "Sobel Vertical", "Box Blur", "Sharpen"])
-                if preset == "Sobel Horizontal":
-                    def_k = "-1 -2 -1\n0 0 0\n1 2 1"
-                elif preset == "Sobel Vertical":
-                    def_k = "-1 0 1\n-2 0 2\n-1 0 1"
-                elif preset == "Box Blur":
-                    def_k = "0.111 0.111 0.111\n0.111 0.111 0.111\n0.111 0.111 0.111"
-                elif preset == "Sharpen":
-                    def_k = "0 -1 0\n-1 5 -1\n0 -1 0"
-                else:
-                    def_k = "0 1 0\n1 -4 1\n0 1 0"
-                ker_2d_txt = st.text_area("Kernel:", value=def_k)
+                method_input = st.selectbox("Payment Method", PAYMENT_METHODS, index=PAYMENT_METHODS.index(default_method) if default_method in PAYMENT_METHODS else 0)
+                desc_input = st.text_area("Description / Notes", value=default_desc, placeholder="e.g., Groceries from Trader Joe's")
 
-            mode_2d = st.selectbox("Convolution Mode", ["same", "valid", "full"])
-            if st.button("Run 2D Convolution", key="btn_conv2d"):
+            submitted = st.form_submit_button("Update Expense" if is_editing else "Save Expense")
+            if submitted:
                 try:
-                    matrix_in = parse_matrix_input(mat_2d_txt)
-                    kernel_in = parse_matrix_input(ker_2d_txt)
-                    res_2d = MatrixEngine.convolve_2d(matrix_in, kernel_in, mode=mode_2d)
-                    st.write(f"**Result ({res_2d.shape[0]}x{res_2d.shape[1]}):**")
-                    st.dataframe(res_2d)
-                except Exception as ex:
-                    st.error(str(ex))
+                    valid_amt = ExpenseValidator.validate_amount(amount_input)
+                    valid_date_str = ExpenseValidator.validate_date(date_input.strftime("%Y-%m-%d"))
+                    valid_cat = ExpenseValidator.validate_category(category_input)
+
+                    if is_editing:
+                        db.update_expense(st.session_state.edit_id, valid_amt, valid_cat, valid_date_str, method_input, desc_input)
+                        st.success(f"Expense #{st.session_state.edit_id} updated successfully!")
+                        st.session_state.edit_id = None
+                        st.rerun()
+                    else:
+                        new_id = db.add_expense(valid_amt, valid_cat, valid_date_str, method_input, desc_input)
+                        st.success(f"Expense logged successfully with ID #{new_id}!")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Submission error: {e}")
+
+        if is_editing:
+            if st.button("Cancel Edit"):
+                st.session_state.edit_id = None
+                st.rerun()
+
+        st.divider()
+        st.subheader("Recent Transactions")
+        if df_expenses.empty:
+            st.write("No transactions logged yet.")
+        else:
+            for _, row in df_expenses.head(10).iterrows():
+                col_info, col_edit, col_del = st.columns([6, 1, 1])
+                with col_info:
+                    st.markdown(
+                        f"**{row['category']}** — ${row['amount']:.2f} &nbsp;|&nbsp; <span style='color:#A0AEC0'>{row['expense_date']}</span> &nbsp;|&nbsp; <em>{row['payment_method']}</em> &nbsp;|&nbsp; {row['description'] or 'No description'}",
+                        unsafe_allow_html=True,
+                    )
+                with col_edit:
+                    if st.button("✏️ Edit", key=f"edit_{row['id']}"):
+                        st.session_state.edit_id = int(row['id'])
+                        st.rerun()
+                with col_del:
+                    if st.button("🗑️ Delete", key=f"del_{row['id']}"):
+                        db.delete_expense(int(row['id']))
+                        st.success(f"Deleted expense #{row['id']}")
+                        st.rerun()
+
+    elif view_selection == "📑 Expense History & Export":
+        st.title("Expense Records & Search")
+
+        if df_expenses.empty:
+            st.info("No expenses recorded yet.")
+        else:
+            f1, f2, f3, f4 = st.columns(4)
+            with f1:
+                search_text = st.text_input("🔍 Search Notes / Payment", value="")
+            with f2:
+                selected_cats = st.multiselect("Category", options=CATEGORIES, default=[])
+            with f3:
+                sort_column = st.selectbox("Sort By", ["Date", "Amount", "Category"], index=0)
+            with f4:
+                sort_direction = st.selectbox("Order", ["Descending", "Ascending"], index=0)
+
+            d1, d2 = st.columns(2)
+            with d1:
+                start_d = st.date_input("Start Date", value=date(date.today().year, 1, 1))
+            with d2:
+                end_d = st.date_input("End Date", value=date.today())
+
+            filtered_df = AnalyticsEngine.filter_and_sort(
+                df_expenses,
+                search_query=search_text,
+                categories=selected_cats if selected_cats else None,
+                start_date=start_d,
+                end_date=end_d,
+                sort_by=sort_column,
+                sort_order=sort_direction,
+            )
+
+            st.write(f"Found **{len(filtered_df)}** matching expenses.")
+
+            display_df = filtered_df[["id", "amount", "category", "expense_date", "payment_method", "description"]].copy()
+            display_df["amount"] = display_df["amount"].apply(lambda x: f"${x:,.2f}")
+            display_df.rename(columns={
+                "id": "ID",
+                "amount": "Amount",
+                "category": "Category",
+                "expense_date": "Date",
+                "payment_method": "Payment Method",
+                "description": "Description"
+            }, inplace=True)
+
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+            csv_data = export_dataframe_to_csv(filtered_df)
+            st.download_button(
+                label="📥 Download Filtered Data as CSV",
+                data=csv_data,
+                file_name=f"spendwise_export_{datetime.today().strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+            )
+
+    elif view_selection == "⚙️ Budget Settings":
+        st.title("Monthly Budget Configuration")
+        st.write("Set and manage spending targets per month.")
+
+        chosen_month = st.selectbox(
+            "Select Target Month",
+            options=[
+                datetime(datetime.today().year, m, 1).strftime("%Y-%m")
+                for m in range(1, 13)
+            ],
+            index=datetime.today().month - 1,
+        )
+
+        saved_budget = db.get_budget(chosen_month)
+
+        with st.form("budget_form"):
+            new_budget = st.number_input(
+                f"Monthly Spending Budget for {chosen_month} ($",
+                min_value=0.0,
+                max_value=1000000.0,
+                value=float(saved_budget if saved_budget > 0 else 500.0),
+                step=50.0,
+                format="%.2f",
+            )
+            save_b_btn = st.form_submit_button("Save Budget Target")
+            if save_b_btn:
+                db.set_budget(chosen_month, new_budget)
+                st.success(f"Budget for {chosen_month} set to ${new_budget:,.2f}!")
+                st.rerun()
 
 
 if __name__ == "__main__":
