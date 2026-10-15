@@ -1,6 +1,6 @@
 # Generated Application
 
-**Requirement:** Build a functional web application called CampusFind — College Lost & Found Portal using Python and Streamlit with search, category filtering, persistent database, and claim reporting.
+**Requirement:** Build a functional kangoroo game similar to google dyno game
 
 **Format:** Streamlit Web App
 
