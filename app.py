@@ -1,274 +1,240 @@
-import streamlit as st
-import numpy as np
-from scipy import linalg
-from scipy.signal import convolve2d
-import sympy as sp
-from typing import Union, List, Dict, Any, Tuple
+"""
+Universal Calculator & Metric Converter CLI Module
 
-# ==========================================
-# BUSINESS LOGIC & ENGINES
-# ==========================================
+Provides robust engines for:
+- Basic Arithmetic
+- Equation Solving (Linear)
+- Unit & Metric Conversion (Length, Volume, Area, Weight, Temperature)
+- Matrix Operations & 2D Convolution
+"""
 
-class BasicCalculator:
+import sys
+import math
+from typing import List, Union, Tuple
+
+class ArithmeticCalculator:
     @staticmethod
-    def calculate(expression: str) -> Union[float, int]:
-        """Safely evaluates a basic mathematical expression."""
-        try:
-            # Using sympy for safe evaluation
-            cleaned = expression.strip()
-            if not cleaned:
-                raise ValueError("Expression cannot be empty.")
-            result = sp.sympify(cleaned)
-            if result.is_number:
-                return float(result)
-            return float(result.evalf())
-        except Exception as e:
-            raise ValueError(f"Invalid mathematical expression: {e}")
+    def add(a: float, b: float) -> float:
+        return a + b
 
     @staticmethod
-    def solve_equation(eq_str: str, var_str: str = 'x') -> List[Any]:
-        """Solves an algebraic equation for a given variable."""
-        try:
-            parts = eq_str.split('=')
-            if len(parts) == 2:
-                lhs = sp.sympify(parts[0].strip())
-                rhs = sp.sympify(parts[1].strip())
-                equation = sp.Eq(lhs, rhs)
+    def subtract(a: float, b: float) -> float:
+        return a - b
+
+    @staticmethod
+    def multiply(a: float, b: float) -> float:
+        return a * b
+
+    @staticmethod
+    def divide(a: float, b: float) -> float:
+        if b == 0:
+            raise ValueError("Division by zero is not allowed.")
+        return a / b
+
+    @staticmethod
+    def power(base: float, exp: float) -> float:
+        return math.pow(base, exp)
+
+    @staticmethod
+    def sqrt(a: float) -> float:
+        if a < 0:
+            raise ValueError("Cannot compute square root of a negative number.")
+        return math.sqrt(a)
+
+
+class EquationSolver:
+    @staticmethod
+    def solve_linear(a: float, b: float) -> float:
+        """Solves ax + b = 0 for x. Returns x."""
+        if a == 0:
+            if b == 0:
+                raise ValueError("Infinite solutions (identity equation 0 = 0).")
             else:
-                equation = sp.sympify(eq_str)
-            
-            var = sp.Symbol(var_str)
-            solutions = sp.solve(equation, var)
-            return solutions
-        except Exception as e:
-            raise ValueError(f"Could not solve equation: {e}")
+                raise ValueError("No solution (contradiction a = 0, b != 0).")
+        return -b / a
 
 
-class MetricConverter:
-    # Conversion factors relative to base unit (meters for length, liters for volume, square meters for area)
-    LENGTH_CONVERSIONS = {
-        'meters': 1.0,
-        'kilometers': 1000.0,
-        'centimeters': 0.01,
-        'millimeters': 0.001,
-        'miles': 1609.34,
-        'yards': 0.9144,
-        'feet': 0.3048,
-        'inches': 0.0254
+class UnitConverter:
+    # Conversion factors relative to base unit (meters, square meters, cubic meters, kilograms, Celsius)
+    LENGTH_FACTORS = {
+        'mm': 0.001,
+        'cm': 0.01,
+        'm': 1.0,
+        'km': 1000.0,
+        'inch': 0.0254,
+        'ft': 0.3048,
+        'mile': 1609.344
     }
 
-    VOLUME_CONVERSIONS = {
-        'liters': 1.0,
-        'milliliters': 0.001,
-        'cubic meters': 1000.0,
-        'cubic centimeters': 0.001,
-        'gallons (US)': 3.78541,
-        'quarts (US)': 0.946353,
-        'cups (US)': 0.24
+    AREA_FACTORS = {
+        'sq_m': 1.0,
+        'sq_cm': 0.0001,
+        'sq_km': 1000000.0,
+        'sq_ft': 0.092903,
+        'acre': 4046.86,
+        'hectare': 10000.0
     }
 
-    AREA_CONVERSIONS = {
-        'square meters': 1.0,
-        'square kilometers': 1e6,
-        'square miles': 2.58999e6,
-        'acres': 4046.86,
-        'hectares': 10000.0,
-        'square feet': 0.092903,
-        'square inches': 0.00064516
+    VOLUME_FACTORS = {
+        'm3': 1.0,
+        'liter': 0.001,
+        'ml': 0.000001,
+        'gallon': 0.00378541,
+        'cup': 0.00024
+    }
+
+    WEIGHT_FACTORS = {
+        'g': 0.001,
+        'kg': 1.0,
+        'mg': 0.000001,
+        'lb': 0.453592,
+        'oz': 0.0283495
     }
 
     @classmethod
-    def convert(cls, value: float, from_unit: str, to_unit: str, category: str) -> float:
-        if category == 'Length':
-            table = cls.LENGTH_CONVERSIONS
-        elif category == 'Volume':
-            table = cls.VOLUME_CONVERSIONS
-        elif category == 'Area':
-            table = cls.AREA_CONVERSIONS
+    def convert_length(cls, value: float, from_unit: str, to_unit: str) -> float:
+        return cls._convert(value, from_unit, to_unit, cls.LENGTH_FACTORS, "length")
+
+    @classmethod
+    def convert_area(cls, value: float, from_unit: str, to_unit: str) -> float:
+        return cls._convert(value, from_unit, to_unit, cls.AREA_FACTORS, "area")
+
+    @classmethod
+    def convert_volume(cls, value: float, from_unit: str, to_unit: str) -> float:
+        return cls._convert(value, from_unit, to_unit, cls.VOLUME_FACTORS, "volume")
+
+    @classmethod
+    def convert_weight(cls, value: float, from_unit: str, to_unit: str) -> float:
+        return cls._convert(value, from_unit, to_unit, cls.WEIGHT_FACTORS, "weight")
+
+    @classmethod
+    def convert_temperature(cls, value: float, from_unit: str, to_unit: str) -> float:
+        fu = from_unit.lower()
+        tu = to_unit.lower()
+        valid = {'c', 'f', 'k'}
+        if fu not in valid or tu not in valid:
+            raise ValueError(f"Invalid temperature unit. Choose from {valid}")
+        
+        # Convert to Celsius first
+        if fu == 'c':
+            c = value
+        elif fu == 'f':
+            c = (value - 32) * 5.0 / 9.0
+        elif fu == 'k':
+            c = value - 273.15
         else:
-            raise ValueError(f"Unknown category: {category}")
+            c = 0.0
 
-        if from_unit not in table or to_unit not in table:
-            raise ValueError("Invalid unit provided.")
+        # Convert from Celsius to target
+        if tu == 'c':
+            return c
+        elif tu == 'f':
+            return c * 9.0 / 5.0 + 32
+        elif tu == 'k':
+            return c + 273.15
+        return c
 
-        # Convert to base, then to target
-        base_value = value * table[from_unit]
-        converted_value = base_value / table[to_unit]
-        return converted_value
+    @staticmethod
+    def _convert(value: float, from_unit: str, to_unit: str, factors: dict, category: str) -> float:
+        fu = from_unit.lower()
+        tu = to_unit.lower()
+        if fu not in factors or tu not in factors:
+            raise ValueError(f"Invalid {category} unit. Valid units: {list(factors.keys())}")
+        base_val = value * factors[fu]
+        return base_val / factors[tu]
 
 
 class MatrixCalculator:
     @staticmethod
-    def parse_matrix(matrix_str: str) -> np.ndarray:
-        """Parses a comma/newline separated string into a numpy array."""
-        try:
-            lines = matrix_str.strip().split('\n')
-            matrix_data = [[float(num.strip()) for num in line.split(',') if num.strip() != ''] for line in lines if line.strip() != '']
-            if not matrix_data:
-                raise ValueError("Empty matrix.")
-            return np.array(matrix_data)
-        except Exception as e:
-            raise ValueError(f"Invalid matrix format. Use comma-separated values per row and newlines for rows: {e}")
-
-    @staticmethod
-    def add(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        if a.shape != b.shape:
+    def add(mat_a: List[List[float]], mat_b: List[List[float]]) -> List[List[float]]:
+        MatrixCalculator._validate_matrix(mat_a)
+        MatrixCalculator._validate_matrix(mat_b)
+        if len(mat_a) != len(mat_b) or len(mat_a[0]) != len(mat_b[0]):
             raise ValueError("Matrices must have the same dimensions for addition.")
-        return a + b
+        return [[mat_a[i][j] + mat_b[i][j] for j in range(len(mat_a[0]))] for i in range(len(mat_a))]
 
     @staticmethod
-    def subtract(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        if a.shape != b.shape:
-            raise ValueError("Matrices must have the same dimensions for subtraction.")
-        return a - b
+    def multiply(mat_a: List[List[float]], mat_b: List[List[float]]) -> List[List[float]]:
+        MatrixCalculator._validate_matrix(mat_a)
+        MatrixCalculator._validate_matrix(mat_b)
+        rows_a, cols_a = len(mat_a), len(mat_a[0])
+        rows_b, cols_b = len(mat_b), len(mat_b[0])
+
+        if cols_a != rows_b:
+            raise ValueError(f"Incompatible dimensions for multiplication: ({rows_a}x{cols_a}) and ({rows_b}x{cols_b}).")
+
+        result = [[0.0 for _ in range(cols_b)] for _ in range(rows_a)]
+        for i in range(rows_a):
+            for j in range(cols_b):
+                for k in range(cols_a):
+                    result[i][j] += mat_a[i][k] * mat_b[k][j]
+        return result
 
     @staticmethod
-    def multiply(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        return np.dot(a, b)
+    def convolve2d(image: List[List[float]], kernel: List[List[float]]) -> List[List[float]]:
+        """Performs 2D discrete convolution without padding (valid convolution)."""
+        MatrixCalculator._validate_matrix(image)
+        MatrixCalculator._validate_matrix(kernel)
+        
+        img_h, img_w = len(image), len(image[0])
+        k_h, k_w = len(kernel), len(kernel[0])
+
+        if k_h > img_h or k_w > img_w:
+            raise ValueError("Kernel dimensions cannot be larger than image dimensions.")
+
+        out_h = img_h - k_h + 1
+        out_w = img_w - k_w + 1
+        output = [[0.0 for _ in range(out_w)] for _ in range(out_h)]
+
+        for i in range(out_h):
+            for j in range(out_w):
+                val = 0.0
+                for ki in range(k_h):
+                    for kj in range(k_w):
+                        val += image[i + ki][j + kj] * kernel[k_h - 1 - ki][k_w - 1 - kj]
+                output[i][j] = val
+        return output
 
     @staticmethod
-    def determinant(a: np.ndarray) -> float:
-        if a.shape[0] != a.shape[1]:
-            raise ValueError("Matrix must be square to calculate determinant.")
-        return float(linalg.det(a))
+    def _validate_matrix(mat: List[List[float]]):
+        if not mat or not mat[0]:
+            raise ValueError("Matrix cannot be empty.")
+        cols = len(mat[0])
+        for row in mat:
+            if len(row) != cols:
+                raise ValueError("Matrix rows must all have the same length.")
 
-    @staticmethod
-    def inverse(a: np.ndarray) -> np.ndarray:
-        if a.shape[0] != a.shape[1]:
-            raise ValueError("Matrix must be square to calculate inverse.")
-        try:
-            return linalg.inv(a)
-        except np.linalg.LinAlgError:
-            raise ValueError("Matrix is singular and cannot be inverted.")
-
-    @staticmethod
-    def convolve(matrix: np.ndarray, kernel: np.ndarray, mode: str = 'same') -> np.ndarray:
-        """Performs 2D convolution between a matrix and a kernel."""
-        return convolve2d(matrix, kernel, mode=mode, boundary='fill', fillvalue=0)
-
-
-# ==========================================
-# STREAMLIT UI INTERFACE
-# ==========================================
 
 def main():
-    st.set_page_config(page_title="Multi-Tool Advanced Calculator", page_icon="🧮", layout="wide")
-    
-    st.title("🧮 Multi-Tool Advanced Calculator Suite")
-    st.markdown("A comprehensive computational tool for basic math, algebra, metric conversions, and matrix/convolution operations.")
+    print("=== Python Universal Calculator Module ===")
+    if len(sys.argv) < 2:
+        print("Usage: python app.py [arithmetic|equation|convert|matrix] ...")
+        sys.exit(1)
 
-    tabs = st.tabs(["Basic Math & Equations", "Metric Converter", "Matrix Operations", "2D Convolution"])
+    mode = sys.argv[1].lower()
+    if mode == 'arithmetic':
+        if len(sys.argv) < 5:
+            print("Usage: python app.py arithmetic [add|sub|mul|div|pow] a b")
+            sys.exit(1)
+        op, a, b = sys.argv[2], float(sys.argv[3]), float(sys.argv[4])
+        if op == 'add': res = ArithmeticCalculator.add(a, b)
+        elif op == 'sub': res = ArithmeticCalculator.subtract(a, b)
+        elif op == 'mul': res = ArithmeticCalculator.multiply(a, b)
+        elif op == 'div': res = ArithmeticCalculator.divide(a, b)
+        elif op == 'pow': res = ArithmeticCalculator.power(a, b)
+        else: raise ValueError(f"Unknown op {op}")
+        print(f"Result: {res}")
 
-    # Tab 1: Basic Math & Equations
-    with tabs[0]:
-        st.header("Basic Arithmetic & Algebraic Solver")
-        col1, col2 = st.columns(2)
+    elif mode == 'equation':
+        if len(sys.argv) < 4:
+            print("Usage: python app.py equation a b  (solves ax + b = 0)")
+            sys.exit(1)
+        a, b = float(sys.argv[2]), float(sys.argv[3])
+        res = EquationSolver.solve_linear(a, b)
+        print(f"Solution x = {res}")
 
-        with col1:
-            st.subheader("Arithmetic Calculator")
-            expr = st.text_input("Enter expression (e.g., (15 + 5) * 3 / 2):", "(15 + 5) * 3 / 2")
-            if st.button("Calculate Expression"):
-                try:
-                    res = BasicCalculator.calculate(expr)
-                    st.success(f"Result: **{res}**")
-                except Exception as e:
-                    st.error(str(e))
-
-        with col2:
-            st.subheader("Equation Solver")
-            eq = st.text_input("Enter equation (e.g., 2*x + 5 = 15 or x**2 - 4 = 0):", "2*x + 5 = 15")
-            var = st.text_input("Variable to solve for:", "x")
-            if st.button("Solve Equation"):
-                try:
-                    sols = BasicCalculator.solve_equation(eq, var)
-                    st.success(f"Solutions for {var}: **{sols}**")
-                except Exception as e:
-                    st.error(str(e))
-
-    # Tab 2: Metric Converter
-    with tabs[1]:
-        st.header("Metric & Unit Converter")
-        category = st.selectbox("Select Category", ["Length", "Volume", "Area"])
-        
-        if category == "Length":
-            units = list(MetricConverter.LENGTH_CONVERSIONS.keys())
-        elif category == "Volume":
-            units = list(MetricConverter.VOLUME_CONVERSIONS.keys())
-        else:
-            units = list(MetricConverter.AREA_CONVERSIONS.keys())
-
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            val = st.number_input("Value to convert", value=1.0)
-        with c2:
-            from_u = st.selectbox("From Unit", units, index=0)
-        with c3:
-            to_u = st.selectbox("To Unit", units, index=min(1, len(units)-1))
-
-        if st.button("Convert Units"):
-            try:
-                converted = MetricConverter.convert(val, from_u, to_u, category)
-                st.metric(label=f"Converted to {to_u}", value=f"{converted:,.6f}")
-            except Exception as e:
-                st.error(str(e))
-
-    # Tab 3: Matrix Operations
-    with tabs[2]:
-        st.header("Matrix Calculator")
-        op = st.selectbox("Operation", ["Addition", "Subtraction", "Multiplication", "Determinant", "Inverse"])
-        
-        st.markdown("Enter matrix values separated by commas per row, and newlines for each row.")
-        m_input_1 = st.text_area("Matrix A:", "1, 2\n3, 4")
-        
-        m_input_2 = ""
-        if op in ["Addition", "Subtraction", "Multiplication"]:
-            m_input_2 = st.text_area("Matrix B:", "5, 6\n7, 8")
-
-        if st.button("Compute Matrix"):
-            try:
-                mat_a = MatrixCalculator.parse_matrix(m_input_1)
-                if op in ["Addition", "Subtraction", "Multiplication"]:
-                    mat_b = MatrixCalculator.parse_matrix(m_input_2)
-                    if op == "Addition":
-                        res_mat = MatrixCalculator.add(mat_a, mat_b)
-                    elif op == "Subtraction":
-                        res_mat = MatrixCalculator.subtract(mat_a, mat_b)
-                    else:
-                        res_mat = MatrixCalculator.multiply(mat_a, mat_b)
-                    st.write("Resultant Matrix:")
-                    st.code(str(res_mat))
-                elif op == "Determinant":
-                    det = MatrixCalculator.determinant(mat_a)
-                    st.success(f"Determinant: **{det}**")
-                elif op == "Inverse":
-                    inv = MatrixCalculator.inverse(mat_a)
-                    st.write("Inverse Matrix:")
-                    st.code(str(inv))
-            except Exception as e:
-                st.error(str(e))
-
-    # Tab 4: 2D Convolution
-    with tabs[3]:
-        st.header("2D Convolution Solver")
-        st.markdown("Perform 2D convolution between an input matrix (e.g. image patch) and a convolution kernel/filter.")
-        
-        col_a, col_b = st.columns(2)
-        with col_a:
-            input_mat_str = st.text_area("Input Matrix", "1, 2, 3\n4, 5, 6\n7, 8, 9")
-        with col_b:
-            kernel_str = st.text_area("Kernel / Filter", "1, 0\n0, -1")
-
-        conv_mode = st.selectbox("Convolution Mode", ["same", "valid", "full"])
-
-        if st.button("Run Convolution"):
-            try:
-                matrix = MatrixCalculator.parse_matrix(input_mat_str)
-                kernel = MatrixCalculator.parse_matrix(kernel_str)
-                conv_result = MatrixCalculator.convolve(matrix, kernel, mode=conv_mode)
-                st.write(f"Convolution Result ({conv_mode} mode):")
-                st.code(str(conv_result))
-            except Exception as e:
-                st.error(str(e))
+    else:
+        print(f"Mode {mode} not fully wired in quick CLI. Run pytest for comprehensive validation.")
 
 
 if __name__ == '__main__':

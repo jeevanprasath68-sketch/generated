@@ -1,83 +1,96 @@
+"""
+Comprehensive Pytest Test Suite for Universal Calculator & Metric Converter
+"""
+
 import pytest
-import numpy as np
-from app import BasicCalculator, MetricConverter, MatrixCalculator
+from app import ArithmeticCalculator, EquationSolver, UnitConverter, MatrixCalculator
 
-def test_basic_calculator_arithmetic():
-    assert BasicCalculator.calculate("2 + 3 * 4") == 14.0
-    assert BasicCalculator.calculate("(10 - 2) / 4") == 2.0
-    with pytest.raises(ValueError):
-        BasicCalculator.calculate("")
-    with pytest.raises(ValueError):
-        BasicCalculator.calculate("2 + *")
+# --- Arithmetic Tests ---
+def test_arithmetic_basic():
+    assert ArithmeticCalculator.add(2, 3) == 5
+    assert ArithmeticCalculator.subtract(5, 2) == 3
+    assert ArithmeticCalculator.multiply(4, 3) == 12
+    assert ArithmeticCalculator.divide(10, 2) == 5
+    assert ArithmeticCalculator.power(2, 3) == 8
+    assert ArithmeticCalculator.sqrt(9) == 3
 
-def test_equation_solver():
-    solutions = BasicCalculator.solve_equation("x**2 - 9 = 0", "x")
-    assert sorted([float(s) for s in solutions]) == [-3.0, 3.0]
+def test_arithmetic_edge_cases():
+    with pytest.raises(ValueError, match="Division by zero"):
+        ArithmeticCalculator.divide(5, 0)
+
+    with pytest.raises(ValueError, match="square root of a negative"):
+        ArithmeticCalculator.sqrt(-4)
+
+
+# --- Equation Solver Tests ---
+def test_equation_solver_linear():
+    # 2x + 4 = 0 -> x = -2
+    assert EquationSolver.solve_linear(2, 4) == -2.0
+    # -3x + 9 = 0 -> x = 3
+    assert EquationSolver.solve_linear(-3, 9) == 3.0
+
+def test_equation_solver_edge_cases():
+    with pytest.raises(ValueError, match="Infinite solutions"):
+        EquationSolver.solve_linear(0, 0)
+
+    with pytest.raises(ValueError, match="No solution"):
+        EquationSolver.solve_linear(0, 5)
+
+
+# --- Unit Converter Tests ---
+def test_unit_converter_length():
+    assert UnitConverter.convert_length(1, 'm', 'cm') == 100.0
+    assert UnitConverter.convert_length(1000, 'm', 'km') == 1.0
+
+def test_unit_converter_temperature():
+    assert UnitConverter.convert_temperature(0, 'c', 'f') == 32.0
+    assert UnitConverter.convert_temperature(100, 'c', 'k') == 373.15
+    assert UnitConverter.convert_temperature(32, 'f', 'c') == 0.0
+
+def test_unit_converter_invalid():
+    with pytest.raises(ValueError, match="Invalid length unit"):
+        UnitConverter.convert_length(10, 'parsec', 'm')
+
+    with pytest.raises(ValueError, match="Invalid temperature unit"):
+        UnitConverter.convert_temperature(25, 'rankine', 'c')
+
+
+# --- Matrix Calculator & Convolution Tests ---
+def test_matrix_operations():
+    mat_a = [[1, 2], [3, 4]]
+    mat_b = [[5, 6], [7, 8]]
     
-    linear_sol = BasicCalculator.solve_equation("3 * x = 12", "x")
-    assert float(linear_sol[0]) == 4.0
-
-def test_metric_converter():
-    # Length conversion
-    meters_to_km = MetricConverter.convert(1000, "meters", "kilometers", "Length")
-    assert meters_to_km == 1.0
-
-    # Volume conversion
-    liters_to_ml = MetricConverter.convert(1.5, "liters", "milliliters", "Volume")
-    assert liters_to_ml == 1500.0
-
-    # Area conversion
-    sqm_to_sqkm = MetricConverter.convert(1e6, "square meters", "square kilometers", "Area")
-    assert sqm_to_sqkm == 1.0
-
-    with pytest.raises(ValueError):
-        MetricConverter.convert(10, "meters", "liters", "Length")
-    with pytest.raises(ValueError):
-        MetricConverter.convert(10, "meters", "kilometers", "InvalidCategory")
-
-def test_matrix_parsing_and_operations():
-    mat_str = "1, 2\n3, 4"
-    parsed = MatrixCalculator.parse_matrix(mat_str)
-    assert parsed.shape == (2, 2)
-    assert np.allclose(parsed, np.array([[1.0, 2.0], [3.0, 4.0]]))
-
-    mat_a = np.array([[1.0, 2.0], [3.0, 4.0]])
-    mat_b = np.array([[2.0, 0.0], [1, 2]])
-
-    # Addition
     added = MatrixCalculator.add(mat_a, mat_b)
-    assert np.allclose(added, np.array([[3.0, 2.0], [4.0, 6.0]]))
+    assert added == [[6, 8], [10, 12]]
 
-    # Subtraction
-    subbed = MatrixCalculator.subtract(mat_a, mat_b)
-    assert np.allclose(subbed, np.array([[-1.0, 2.0], [2.0, 2.0]]))
-
-    # Multiplication
     mult = MatrixCalculator.multiply(mat_a, mat_b)
-    assert np.allclose(mult, np.array([[4.0, 4.0], [10.0, 8.0]]))
+    assert mult == [[19, 22], [43, 50]]
 
-    # Determinant
-    det = MatrixCalculator.determinant(mat_a)
-    assert pytest.approx(det, 0.01) == -2.0
-
-    # Inverse
-    inv = MatrixCalculator.inverse(mat_a)
-    expected_inv = np.array([[-2.0, 1.0], [1.5, -0.5]])
-    assert np.allclose(inv, expected_inv)
-
-    # Dimension error checks
-    with pytest.raises(ValueError):
-        MatrixCalculator.add(mat_a, np.array([[1.0]]))
+def test_matrix_convolution():
+    image = [
+        [1, 2, 3,
+         4],
+        [5, 6, 7,
+         8],
+        [9, 10, 11,
+         12]
+    ] # 3x4
+    kernel = [
+        [1, 0],
+        [0, -1]
+    ] # 2x2
     
-    # Singular matrix inverse error check
-    singular_mat = np.array([[1.0, 2.0], [2.0, 4.0]])
-    with pytest.raises(ValueError):
-        MatrixCalculator.inverse(singular_mat)
+    # Convolution should produce (3-2+1) x (4-2+1) = 2 x 3 matrix
+    result = MatrixCalculator.convolve2d(image, kernel)
+    assert len(result) == 2
+    assert len(result[0]) == 3
 
-def test_convolution_solver():
-    matrix = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]])
-    kernel = np.array([[1.0, 0.0], [0.0, -1.0]])
-    
-    conv_res = MatrixCalculator.convolve(matrix, kernel, mode='same')
-    assert conv_res.shape == (3, 3)
-    assert isinstance(conv_res, np.ndarray)
+def test_matrix_edge_cases():
+    with pytest.raises(ValueError, match="same dimensions"):
+        MatrixCalculator.add([[1, 2]], [[1, 2, 3]])
+
+    with pytest.raises(ValueError, match="Incompatible dimensions"):
+        MatrixCalculator.multiply([[1, 2]], [[1], [2], [3]])
+
+    with pytest.raises(ValueError, match="Kernel dimensions cannot be larger"):
+        MatrixCalculator.convolve2d([[1]], [[1, 2], [3, 4]])
