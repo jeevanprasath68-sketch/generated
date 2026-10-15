@@ -1,66 +1,94 @@
 import pytest
-from datetime import datetime
-from app import BankAccount, Transaction
+from datetime import date
+from app import LostFoundEngine
 
-def test_account_creation_happy_path():
-    acc = BankAccount("ACC-001", "Alice Smith", initial_balance=500.0, overdraft_limit=200.0)
-    assert acc.account_number == "ACC-001"
-    assert acc.owner_name == "Alice Smith"
-    assert acc.balance == 500.0
-    assert acc.overdraft_limit == 200.0
-    assert len(acc.transactions) == 1
-    assert acc.transactions[0].tx_type == "INITIAL_DEPOSIT"
+@pytest.fixture
+def test_engine(tmp_path):
+    db_file = tmp_path / "test_campusfind.db"
+    engine = LostFoundEngine(db_path=f"sqlite:///{db_file}")
+    return engine
 
-def test_deposit_happy_path():
-    acc = BankAccount("ACC-002", "Bob Jones", initial_balance=100.0, overdraft_limit=0.0)
-    new_bal = acc.deposit(250.0)
-    assert new_bal == 350.0
-    assert acc.balance == 350.0
-    assert len(acc.transactions) == 2
-    assert acc.transactions[-1].tx_type == "DEPOSIT"
+def test_add_item_happy_path(test_engine):
+    item_data = {
+        "title": "MacBook Pro 14",
+        "category": "Electronics",
+        "location": "Student Union",
+        "date_lost_found": date(2023, 10, 25),
+        "status": "Lost",
+        "description": "Space gray with sticker on lid",
+        "contact_email": "student@campus.edu"
+    }
+    item_id = test_engine.add_item(item_data)
+    assert item_id == 1
+    
+    items = test_engine.get_items()
+    assert len(items) == 1
+    assert items[0]['title'] == "MacBook Pro 14"
+    assert items[0]['status'] == "Lost"
 
-def test_withdraw_within_overdraft():
-    acc = BankAccount(
-        account_number="ACC-003",
-        owner_name="Charlie Brown",
-        initial_balance=100.0,
-        overdraft_limit=200.0
-    )
-    # Withdraw more than balance but within overdraft limit (balance + overdraft = 300)
-    new_bal = acc.withdraw(250.0)
-    assert new_bal == -150.0
-    assert acc.balance == -150.0
-    assert acc.transactions[-1].tx_type == "WITHDRAWAL"
+def test_get_items_filtering_and_search(test_engine):
+    test_engine.add_item({
+        "title": "Calculus Textbook",
+        "category": "Books & Notes",
+        "location": "Library",
+        "date_lost_found": date(2023, 10, 26),
+        "status": "Found",
+        "description": "Stewart 8th edition",
+        "contact_email": "finder@campus.edu"
+    })
+    test_engine.add_item({
+        "title": "Calculus Notes",
+        "category": "Books & Notes",
+        "location": "Science Hall",
+        "date_lost_found": date(2023, 10, 27),
+        "status": "Lost",
+        "description": "Loose leaf binder",
+        "contact_email": "student2@campus.edu"
+    })
+    
+    # Test search query
+    results = test_engine.get_items(search_query="Calculus")
+    assert len(results) == 2
+    
+    # Test category filter
+    results_cat = test_engine.get_items(category="Books & Notes")
+    assert len(results_cat) == 2
+    
+    # Test status filter
+    results_status = test_engine.get_items(status="Found")
+    assert len(results_status) == 1
+    assert results_status[0]['title'] == "Calculus Textbook"
 
-def test_withdraw_exceeds_overdraft_raises_error():
-    acc = BankAccount(
-        account_number="ACC-004",
-        owner_name="Diana Prince",
-        initial_balance=100.0,
-        overdraft_limit=50.0
-    )
-    # Available limit is 150. Trying to withdraw 200 should fail.
-    with pytest.raises(ValueError, match="Insufficient funds"):
-        acc.withdraw(200.0)
+def test_submit_claim(test_engine):
+    item_id = test_engine.add_item({
+        "title": "Campus Dorm Key",
+        "category": "Keys",
+        "location": "Quad",
+        "date_lost_found": date(2023, 10, 28),
+        "status": "Found",
+        "description": "Key ring with blue strap",
+        "contact_email": "security@campus.edu"
+    })
+    
+    success = test_engine.submit_claim(item_id, "Room 402 key tag attached")
+    assert success is True
+    
+    items = test_engine.get_items(status="Claimed")
+    assert len(items) == 1
+    assert items[0]['status'] == "Claimed"
+    assert items[0]['claim_details'] == "Room 402 key tag attached"
 
-def test_transfer_between_accounts():
-    acc1 = BankAccount("ACC-A", "Sender", initial_balance=500.0, overdraft_limit=100.0)
-    acc2 = BankAccount("ACC-B", "Receiver", initial_balance=100.0, overdraft_limit=0.0)
+def test_submit_claim_invalid_id(test_engine):
+    success = test_engine.submit_claim(999, "Invalid claim")
+    assert success is False
 
-    acc1.transfer(acc2, 200.0)
-
-    assert acc1.balance == 300.0
-    assert acc2.balance == 300.0
-    assert acc1.transactions[-1].tx_type == "TRANSFER_OUT"
-    assert acc2.transactions[-1].tx_type == "TRANSFER_IN"
-
-def test_invalid_negative_amounts():
-    acc = BankAccount("ACC-005", "Test User", initial_balance=100.0, overdraft_limit=50.0)
-    with pytest.raises(ValueError, match="Deposit amount must be positive"):
-        acc.deposit(-50.0)
-
-    with pytest.raises(ValueError, match="Withdrawal amount must be positive"):
-        acc.withdraw(-10.0)
-
-    with pytest.raises(ValueError, match="Overdraft limit cannot be negative"):
-        BankAccount("ACC-006", "Bad Limit", initial_balance=0.0, overdraft_limit=-10.0)
+def test_add_item_missing_required_fields(test_engine):
+    with pytest.raises(Exception):
+        # Missing mandatory 'title'
+        test_engine.add_item({
+            "category": "Electronics",
+            "location": "Library",
+            "date_lost_found": date(2023, 10, 25),
+            "status": "Lost",
+            "contact_email": "test@campus.edu"
+        })

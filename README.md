@@ -1,6 +1,6 @@
 # Generated Application
 
-**Requirement:** Build a BankAccount system with deposit, withdraw with an overdraft limit, transfer to other accounts, and transaction history.
+**Requirement:** Build a functional web application called CampusFind — College Lost & Found Portal using Python and Streamlit with search, category filtering, persistent database, and claim reporting.
 
 **Format:** Streamlit Web App
 

@@ -1,273 +1,251 @@
+import os
 import streamlit as st
 import pandas as pd
-from datetime import datetime
-from typing import List, Dict, Optional
+from datetime import datetime, date
+from typing import List, Dict, Any, Optional
+from sqlalchemy import create_engine, Column, Integer, String, Date, Text
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
-# ==========================================
-# DOMAIN MODELS & BUSINESS LOGIC
-# ==========================================
+# --- DATABASE & ORM SETUP ---
+Base = declarative_base()
 
-class Transaction:
-    def __init__(self, tx_id: str, timestamp: datetime, tx_type: str, amount: float, balance_after: float, description: str):
-        self.tx_id = tx_id
-        self.timestamp = timestamp
-        self.tx_type = tx_type  # 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT'
-        self.amount = amount
-        self.balance_after = balance_after
-        self.description = description
+class DBItem(Base):
+    __tablename__ = 'lost_found_items'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    title = Column(String(150), nullable=False)
+    category = Column(String(50), nullable=False)
+    location = Column(String(100), nullable=False)
+    date_lost_found = Column(Date, nullable=False)
+    status = Column(String(20), nullable=False, default='Lost')  # 'Lost', 'Found', 'Claimed'
+    description = Column(Text, nullable=True)
+    contact_email = Column(String(120), nullable=False)
+    claim_details = Column(Text, nullable=True)
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> Dict[str, Any]:
         return {
-            "Transaction ID": self.tx_id,
-            "Timestamp": self.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-            "Type": self.tx_type,
-            "Amount ($)": round(self.amount, 2),
-            "Balance After ($)": round(self.balance_after, 2),
-            "Description": self.description
+            "id": self.id,
+            "title": self.title,
+            "category": self.category,
+            "location": self.location,
+            "date_lost_found": self.date_lost_found,
+            "status": self.status,
+            "description": self.description,
+            "contact_email": self.contact_email,
+            "claim_details": self.claim_details
         }
 
+class LostFoundEngine:
+    def __init__(self, db_path: str = "sqlite:///campusfind.db"):
+        self.engine = create_engine(db_path, connect_args={"check_same_thread": False})
+        Base.metadata.create_all(self.engine)
+        self.SessionLocal = sessionmaker(bind=self.engine)
 
-class BankAccount:
-    def __init__(self, account_number: str, owner_name: str, initial_balance: float = 0.0, overdraft_limit: float = 0.0):
-        if initial_balance < 0 and abs(initial_balance) > overdraft_limit:
-            raise ValueError("Initial balance exceeds overdraft limit.")
-        if overdraft_limit < 0:
-            raise ValueError("Overdraft limit cannot be negative.")
+    def add_item(self, data: Dict[str, Any]) -> int:
+        session = self.SessionLocal()
+        try:
+            db_item = DBItem(
+                title=data['title'],
+                category=data['category'],
+                location=data['location'],
+                date_lost_found=data['date_lost_found'],
+                status=data['status'],
+                description=data.get('description', ''),
+                contact_email=data['contact_email']
+            )
+            session.add(db_item)
+            session.commit()
+            session.refresh(db_item)
+            return db_item.id
+        except Exception as e:
+            session.rollback()
+            raise e
+        finally:
+            session.close()
 
-        self.account_number = account_number
-        self.owner_name = owner_name
-        self.balance = float(initial_balance)
-        self.overdraft_limit = float(overdraft_limit)
-        self.transactions: List[Transaction] = []
-        
-        # Record initial funding if any
-        if initial_balance != 0:
-            self._record_transaction("INITIAL_DEPOSIT", initial_balance, "Account opened with initial balance")
-
-    def _record_transaction(self, tx_type: str, amount: float, description: str):
-        tx_id = f"TXN-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
-        tx = Transaction(
-            tx_id=tx_id,
-            timestamp=datetime.now(),
-            tx_type=tx_type,
-            amount=amount,
-            balance_after=self.balance,
-            description=description
-        )
-        self.transactions.append(tx)
-
-    def deposit(self, amount: float) -> float:
-        if amount <= 0:
-            raise ValueError("Deposit amount must be positive.")
-        self.balance += amount
-        self._record_transaction("DEPOSIT", amount, f"Deposited $\f{amount:.2f}")
-        return self.balance
-
-    def withdraw(self, amount: float) -> float:
-        if amount <= 0:
-            raise ValueError("Withdrawal amount must be positive.")
-        
-        available_funds = self.balance + self.overdraft_limit
-        if amount > available_funds:
-            raise ValueError(f"Insufficient funds. Requested $\f{amount:.2f} exceeds available limit $\f{available_funds:.2f}.")
+    def get_items(self, search_query: str = "", category: str = "All", status: str = "All") -> List[Dict[str, Any]]:
+        session = self.SessionLocal()
+        try:
+            query = session.query(DBItem)
             
-        self.balance -= amount
-        self._record_transaction("WITHDRAWAL", amount, f"Withdrew $\f{amount:.2f}")
-        return self.balance
-
-    def transfer(self, target_account: 'BankAccount', amount: float):
-        if amount <= 0:
-            raise ValueError("Transfer amount must be positive.")
-        if self.account_number == target_account.account_number:
-            raise ValueError("Cannot transfer to the same account.")
+            if status != "All":
+                query = query.filter(DBItem.status == status)
             
-        # Withdraw from source
-        self.withdraw(amount)
-        self.transactions[-1].description = f"Transferred $\f{amount:.2f} to {target_account.account_number}"
-        self.transactions[-1].tx_type = "TRANSFER_OUT"
+            if category != "All":
+                query = query.filter(DBItem.category == category)
+                
+            if search_query:
+                sq = f"%{search_query}%"
+                query = query.filter(
+                    (DBItem.title.ilike(sq)) |
+                    (DBItem.description.ilike(sq)) |
+                    (DBItem.location.ilike(sq))
+                )
+                
+            items = query.order_by(DBItem.date_lost_found.desc()).all()
+            return [item.to_dict() for item in items]
+        finally:
+            session.close()
 
-        # Deposit to target
-        target_account.balance += amount
-        target_account._record_transaction("TRANSFER_IN", amount, f"Received $\f{amount:.2f} from {self.account_number}")
+    def submit_claim(self, item_id: int, claim_details: str) -> bool:
+        session = self.SessionLocal()
+        try:
+            item = session.query(DBItem).filter(DBItem.id == item_id).first()
+            if item:
+                item.claim_details = claim_details
+                item.status = "Claimed"
+                session.commit()
+                return True
+            return False
+        except Exception as e:
+            session.rollback()
+            raise e
+        finally:
+            session.close()
 
-
-class BankSystem:
-    def __init__(self):
-        if "accounts" not in st.session_state:
-            st.session_state.accounts = {}
-
-    def create_account(self, account_number: str, owner_name: str, initial_balance: float, overdraft_limit: float) -> BankAccount:
-        if not account_number.strip():
-            raise ValueError("Account number cannot be empty.")
-        if not owner_name.strip():
-            raise ValueError("Owner name cannot be empty.")
-        if account_number in st.session_state.accounts:
-            raise ValueError(f"Account {account_number} already exists.")
-            
-        acc = BankAccount(account_number, owner_name, initial_balance, overdraft_limit)
-        st.session_state.accounts[account_number] = acc
-        return acc
-
-    def get_account(self, account_number: str) -> Optional[BankAccount]:
-        return st.session_state.accounts.get(account_number)
-
-    def list_accounts(self) -> List[BankAccount]:
-        return list(st.session_state.accounts.values())
-
-
-# ==========================================
-# STREAMLIT USER INTERFACE
-# ==========================================
-
+# --- STREAMLIT UI ----
 def main():
     st.set_page_config(
-        page_title="Enterprise BankAccount System",
-        page_icon="🏦",
+        page_title="CampusFind — College Lost & Found Portal",
+        page_icon="🎒",
         layout="wide"
     )
+    
+    # Initialize Engine
+    if 'engine' not in st.session_state:
+        st.session_state.engine = LostFoundEngine()
+        
+    engine: LostFoundEngine = st.session_state.engine
 
-    bank_system = BankSystem()
-
-    st.title("🏦 Secure Bank Account & Ledger System")
-    st.markdown("Manage bank accounts, perform deposits, overdraft-enabled withdrawals, account transfers, and audit transaction histories.")
+    st.title("🎒 CampusFind — College Lost & Found Portal")
+    st.markdown("Welcome to the official campus hub to report, search, and claim lost or found belongings! ✨")
 
     # Sidebar navigation
     st.sidebar.title("Navigation")
-    choice = st.sidebar.selectbox("Choose Action", [
-        "Dashboard & Overview",
-        "Create Account",
-        "Deposit / Withdraw",
-        "Transfer Funds",
-        "Transaction History"
-    ])
+    choice = st.sidebar.radio("Go to", ["Browse & Search Items", "Report Lost/Found Item", "Claim Dashboard"])
 
-    accounts = bank_system.list_accounts()
+    # CATEGORIES
+    categories = ["All", "Electronics", "IDs & Cards", "Books & Notes", "Clothing & Accessories", "Keys", "Others"]
+    statuses = ["All", "Lost", "Found", "Claimed"]
 
-    if choice == "Dashboard & Overview":
-        st.header("📊 Bank Overview Dashboard")
+    if choice == "Browse & Search Items":
+        st.header("🔍 Browse & Search Items")
         
-        if not accounts:
-            st.info("No bank accounts found. Head to 'Create Account' to get started.")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            search_query = st.text_input("Search keywords (title, description, location)", "")
+        with col2:
+            selected_cat = st.selectbox("Filter by Category", categories)
+        with col3:
+            selected_status = st.selectbox("Filter by Status", statuses)
+            
+        items = engine.get_items(search_query=search_query, category=selected_cat, status=selected_status)
+        
+        # KPIs
+        total_items = len(items)
+        lost_count = sum(1 for i in items if i['status'] == 'Lost')
+        found_count = sum(1 for i in items if i['status'] == 'Found')
+        claimed_count = sum(1 for i in items if i['status'] == 'Claimed')
+        
+        kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+        kpi1.metric("Matching Items", total_items)
+        kpi2.metric("Lost", lost_count)
+        kpi3.metric("Found", found_count)
+        kpi4.metric("Claimed", claimed_count)
+        
+        st.divider()
+        
+        if not items:
+            st.info("No items found matching your criteria.")
         else:
-            col1, col2, col3 = st.columns(3)
-            total_deposits = sum(acc.balance for acc in accounts)
-            total_overdraft = sum(acc.overdraft_limit for acc in accounts)
-            
-            col1.metric("Total Accounts", len(accounts))
-            col2.metric("Total Capital ($)", f"${total_deposits:,.2f}")
-            col3.metric("Total Overdraft Limit ($)", f"${total_overdraft:,.2f}")
-            
-            st.subheader("Active Accounts Summary")
-            data = [{
-                "Account Number": acc.account_number,
-                "Owner": acc.owner_name,
-                "Balance ($)": round(acc.balance, 2),
-                "Overdraft Limit ($)": round(acc.overdraft_limit, 2),
-                "Available Funds ($)": round(acc.balance + acc.overdraft_limit, 2),
-                "Total Transactions": len(acc.transactions)
-            } for acc in accounts]
-            
-            st.dataframe(pd.DataFrame(data), use_container_width=True)
+            for item in items:
+                with st.container():
+                    col_a, col_b = st.columns([3, 1])
+                    with col_a:
+                        status_badge = f"🟢 {item['status']}" if item['status'] == 'Found' else (f"🔴 {item['status']}" if item['status'] == 'Lost' else f"🔵 {item['status']}")
+                        st.subheader(f"{item['title']} [{status_badge}]")
+                        st.markdown(f"**Category:** {item['category']} | **Location:** {item['location']} | **Date:** {item['date_lost_found']}")
+                        if item['description']:
+                            st.write(f"{item['description']}")
+                        st.caption(f"Contact: {item['contact_email']}")
+                    with col_b:
+                        if item['status'] != 'Claimed':
+                            if st.button(f"Claim / Info #{item['id']}", key=f"btn_{item['id']}"):
+                                st.session_state['claiming_item_id'] = item['id']
+                        else:
+                            st.success("Item Claimed")
+                    st.markdown("---")
 
-    elif choice == "Create Account":
-        st.header("➕ Open New Bank Account")
+    elif choice == "Report Lost/Found Item":
+        st.header("📝 Report a Lost or Found Item")
         
-        with st.form("create_account_form"):
-            acc_num = st.text_input("Account Number", placeholder="e.g. ACC-1001")
-            owner = st.text_input("Owner Full Name", placeholder="e.g. Jane Doe")
-            initial_bal = st.number_input("Initial Deposit ($)", value=0.0, step=50.0)
-            overdraft = st.number_input("Overdraft Limit ($)", value=100.0, step=50.0, min_value=0.0)
-            
-            submitted = st.form_submit_button("Create Account")
-            if submitted:
-                try:
-                    bank_system.create_account(acc_num, owner, initial_bal, overdraft)
-                    st.success(f"Account {acc_num} successfully created for {owner}!")
-                except ValueError as e:
-                    st.error(str(e))
-
-    elif choice == "Deposit / Withdraw":
-        st.header("💸 Deposit & Withdrawal Operations")
-        
-        if not accounts:
-            st.warning("Please create an account first.")
-        else:
-            acc_map = {f"{acc.account_number} ({acc.owner_name})": acc for acc in accounts}
-            selected_key = st.selectbox("Select Account", list(acc_map.keys()))
-            selected_acc = acc_map[selected_key]
-            
-            st.info(f"Current Balance: **${selected_acc.balance:,.2f}** | Overdraft Limit: **${selected_acc.overdraft_limit:,.2f}** | Available: **${selected_acc.balance + selected_acc.overdraft_limit:,.2f}**")
-            
-            op_type = st.radio("Operation Type", ["Deposit", "Withdraw"])
-            amount = st.number_input("Amount ($)", min_value=0.01, value=50.0, step=10.0)
-            
-            if st.button("Execute Transaction"):
-                try:
-                    if op_type == "Deposit":
-                        new_bal = selected_acc.deposit(amount)
-                        st.success(f"Successfully deposited ${amount:,.2f}. New Balance: **${new_bal:,.2f}**")
-                    else:
-                        new_bal = selected_acc.withdraw(amount)
-                        st.success(f"Successfully withdrew ${amount:,.2f}. New Balance: **${new_bal:,.2f}**")
-                except ValueError as e:
-                    st.error(str(e))
-
-    elif choice == "Transfer Funds":
-        st.header("🔄 Inter-Account Transfer")
-        
-        if len(accounts) < 2:
-            st.warning("At least two accounts are required to perform transfers.")
-        else:
-            acc_map = {f"{acc.account_number} ({acc.owner_name})": acc for acc in accounts}
-            
+        with st.form("report_form", clear_on_submit=True):
             col1, col2 = st.columns(2)
             with col1:
-                src_key = st.selectbox("Source Account (Sender)", list(acc_map.keys()), key="src")
-                src_acc = acc_map[src_key]
+                title = st.text_input("Item Title (e.g., Blue HydroFlask, Student ID)", "")
+                category = st.selectbox("Category", categories[1:])
+                location = st.text_input("Location (e.g., Library 2nd Floor, Science Hall)", "")
             with col2:
-                # Filter out source account from target options
-                target_options = [k for k in acc_map.keys() if k != src_key]
-                target_key = st.selectbox("Target Account (Receiver)", target_options, key="tgt")
-                target_acc = acc_map[target_key]
+                status = st.selectbox("Status", ["Lost", "Found"])
+                date_lost_found = st.date_input("Date", value=date.today())
+                contact_email = st.text_input("Your Campus Email", "")
                 
-            st.info(f"Sender Available Funds: **${src_acc.balance + src_acc.overdraft_limit:,.2f}**")
-            transfer_amount = st.number_input("Transfer Amount ($)", min_value=0.01, value=100.0, step=25.0)
+            description = st.text_area("Detailed Description (Serial numbers, distinguishing marks, etc.)", "")
             
-            if st.button("Transfer Funds"):
-                try:
-                    src_acc.transfer(target_acc, transfer_amount)
-                    st.success(f"Successfully transferred ${transfer_amount:,.2f} from {src_acc.account_number} to {target_acc.account_number}!")
-                except ValueError as e:
-                    st.error(str(e))
+            submitted = st.form_submit_button("Submit Report")
+            if submitted:
+                if not title or not location or not contact_email:
+                    st.error("Please fill out all required fields (Title, Location, Email).")
+                else:
+                    try:
+                        new_id = engine.add_item({
+                            "title": title,
+                            "category": category,
+                            "location": location,
+                            "date_lost_found": date_lost_found,
+                            "status": status,
+                            "description": description,
+                            "contact_email": contact_email
+                        })
+                        st.success(f"Success! Your item has been logged with ID #{new_id}.")
+                    except Exception as e:
+                        st.error(f"An error occurred: {e}")
 
-    elif choice == "Transaction History":
-        st.header("📜 Audit & Transaction History")
+    elif choice == "Claim Dashboard":
+        st.header("🏷️ Item Claim Verification")
+        st.markdown("Have you found your lost item listed on CampusFind? Submit a claim request here for verification by campus security or the finder.")
         
-        if not accounts:
-            st.warning("No accounts available.")
+        # Allow picking item ID or pre-selected from browse
+        default_id = st.session_state.get('claiming_item_id', 1)
+        
+        all_active_items = [i for i in engine.get_items(status="All") if i['status'] != 'Claimed']
+        if not all_active_items:
+            st.info("No unclaimed items available to claim right now.")
         else:
-            acc_map = {f"{acc.account_number} ({acc.owner_name})": acc for acc in accounts}
-            selected_key = st.selectbox("Select Account to Audit", list(acc_map.keys()))
-            selected_acc = acc_map[selected_key]
+            item_options = {f"#{item['id']} - {item['title']} ({item['status']})": item['id'] for item in all_active_items}
+            selected_label = st.selectbox("Select Item to Claim", list(item_options.keys()))
+            target_id = item_options[selected_label]
             
-            st.subheader(f"Ledger for {selected_acc.account_number}")
-            st.metric("Current Balance", f"${selected_acc.balance:,.2f}")
+            # Show target item details
+            selected_item = next((i for i in all_active_items if i['id'] == target_id), None)
+            if selected_item:
+                st.info(f"**Selected:** {selected_item['title']} | **Location:** {selected_item['location']} | **Contact:** {selected_item['contact_email']}")
             
-            if not selected_acc.transactions:
-                st.info("No transactions recorded for this account yet.")
-            else:
-                tx_data = [tx.to_dict() for tx in selected_acc.transactions]
-                df_tx = pd.DataFrame(tx_data)
+            with st.form("claim_form"):
+                claim_details = st.text_area("Proof of Ownership / Verification Details (e.g., student ID number, unique scratches, contents inside bag)", "")
+                claim_submit = st.form_submit_button("Submit Claim")
                 
-                # Filter by type
-                tx_types = ["All"] + list(df_tx["Type"].unique())
-                selected_type = st.selectbox("Filter by Transaction Type", tx_types)
-                
-                if selected_type != "All":
-                    df_tx = df_tx[df_tx["Type"] == selected_type]
-                    
-                st.dataframe(df_tx, use_container_width=True)
+                if claim_submit:
+                    if not claim_details.strip():
+                        st.error("Please provide ownership details for verification.")
+                    else:
+                        success = engine.submit_claim(target_id, claim_details)
+                        if success:
+                            st.success("Claim submitted successfully! The finder or campus office will contact you via email.")
+                            if 'claiming_item_id' in st.session_state:
+                                del st.session_state['claiming_item_id']
+                        else:
+                            st.error("Failed to submit claim. Item may no longer exist.")
 
-
-if __name__ == "__main اصلی" or __name__ == "__main__":
+if __name__ == '__main__':
     main()
