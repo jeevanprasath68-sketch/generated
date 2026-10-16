@@ -1,175 +1,258 @@
-import random
-import time
-from typing import List, Tuple
+import sqlite3
+import datetime
+from typing import List, Dict, Any, Optional
 import streamlit as st
-import streamlit.components.v1 as components
 
-GRID_SIZE = 20
+# ==========================================
+# BUSINESS LOGIC & DATA ENGINE
+# ==========================================
 
-class SnakeGame:
-    def __init__(self, width: int = GRID_SIZE, height: int = GRID_SIZE):
-        self.width = width
-        self.height = height
-        self.reset()
+class CampusDatabase:
+    def __init__(self, db_path: str = "campusfind.db"):
+        self.db_path = db_path
+        self._init_db()
 
-    def reset(self):
-        self.snake: List[Tuple[int, int]] = [
-            (self.width // 2, self.height // 2),
-            (self.width // 2, self.height // 2 + 1),
-            (self.width // 2, self.height // 2 + 2)
-        ]
-        self.direction = "UP"
-        self.next_direction = "UP"
-        self.score = 0
-        self.game_over = False
-        self.spawn_food()
+    def _get_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
 
-    def spawn_food(self):
-        while True:
-            fx = random.randint(0, self.width - 1)
-            fy = random.randint(0, self.height - 1)
-            if (fx, fy) not in self.snake:
-                self.food = (fx, fy)
-                break
+    def _init_db(self) -> None:
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    location TEXT NOT NULL,
+                    date_reported TEXT NOT NULL,
+                    reporter_name TEXT NOT NULL,
+                    reporter_contact TEXT NOT NULL,
+                    claim_status TEXT DEFAULT 'Unclaimed',
+                    claim_notes TEXT DEFAULT ''
+                )
+                """
+            )
+            conn.commit()
 
-    def change_direction(self, new_dir: str):
-        opposites = {"UP": "DOWN", "DOWN": "UP", "LEFT": "RIGHT", "RIGHT": "LEFT"}
-        if new_dir in opposites and opposites[new_dir] != self.next_direction:
-            self.next_direction = new_dir
+    def add_item(self, data: Dict[str, Any]) -> int:
+        required_fields = ['title', 'description', 'category', 'status', 'location', 'reporter_name', 'reporter_contact']
+        for field in required_fields:
+            if not data.get(field):
+                raise ValueError(f"Missing required field: {field}")
 
-    def step(self):
-        if self.game_over:
-            return
+        date_reported = data.get('date_reported', datetime.date.today().isoformat())
+        
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO items (title, description, category, status, location, date_reported, reporter_name, reporter_contact, claim_status, claim_notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Unclaimed', '')
+                """,
+                (
+                    data['title'],
+                    data['description'],
+                    data['category'],
+                    data['status'],
+                    data['location'],
+                    date_reported,
+                    data['reporter_name'],
+                    data['reporter_contact']
+                )
+            )
+            conn.commit()
+            return cursor.lastrowid
 
-        self.direction = self.next_direction
-        hx, hy = self.snake[0]
+    def get_items(self, search_query: str = "", category: str = "All", status: str = "All") -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            query = "SELECT * FROM items WHERE 1=1"
+            params = []
 
-        if self.direction == "UP":
-            ny = hy - 1
-            nx = hx
-        elif self.direction == "DOWN":
-            ny = hy + 1
-            nx = hx
-        elif self.direction == "LEFT":
-            nx = hx - 1
-            ny = hy
-        elif self.direction == "RIGHT":
-            nx = hx + 1
-            ny = hy
-        else:
-            nx, ny = hx, hy
+            if search_query:
+                query += " AND (title LIKE ? OR description LIKE ? OR location LIKE ?)"
+                like_term = f"%{search_query}%"
+                params.extend([like_term, like_term, like_term])
 
-        # Wall collision
-        if nx < 0 or nx >= self.width or ny < 0 or ny >= self.height:
-            self.game_over = True
-            return
+            if category != "All":
+                query += " AND category = ?"
+                params.append(category)
 
-        # Self collision
-        if (nx, ny) in self.snake:
-            self.game_over = True
-            return
+            if status != "All":
+                query += " AND status = ?"
+                params.append(status)
 
-        new_head = (nx, ny)
-        self.snake.insert(0, new_head)
+            query += " ORDER BY date_reported DESC, id DESC"
+            cursor = conn.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]
 
-        # Food collision
-        if new_head == self.food:
-            self.score += 10
-            self.spawn_food()
-        else:
-            self.snake.pop()
+    def update_claim(self, item_id: int, claim_status: str, claim_notes: str) -> bool:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE items SET claim_status = ?, claim_notes = ? WHERE id = ?
+                """,
+                (claim_status, claim_notes, item_id)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
 
-def get_board_html(game: SnakeGame) -> str:
-    cell_size = 20
-    board_width = game.width * cell_size
-    board_height = game.height * cell_size
-    
-    cells_html = ""
-    for y in range(game.height):
-        for x in range(game.width):
-            pos = (x, y)
-            bg = "#1e1e1e"
-            if pos == game.food:
-                bg = "#ff5252"
-            elif pos == game.snake[0]:
-                bg = "#4caf50"
-            elif pos in game.snake:
-                bg = "#81c784"
-            cells_html += f'<div style="position:absolute; left:{x*cell_size}px; top:{y*cell_size}px; width:{cell_size-1}px; height:{cell_size-1}px; background:{bg}; border-radius:3px;"></div>'
+    def get_stats(self) -> Dict[str, int]:
+        with self._get_connection() as conn:
+            total = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+            lost = conn.execute("SELECT COUNT(*) FROM items WHERE status='Lost'").fetchone()[0]
+            found = conn.execute("SELECT COUNT(*) FROM items WHERE status='Found'").fetchone()[0]
+            claimed = conn.execute("SELECT COUNT(*) FROM items WHERE claim_status='Claimed'").fetchone()[0]
+            return {
+                "total": total,
+                "lost": lost,
+                "found": found,
+                "claimed": claimed
+            }
 
-    html_code = f"""
-    <div id="game-container" tabindex="0" style="width: {board_width}px; height: {board_height}px; position: relative; background: #121212; border: 2px solid #333; outline: none; margin: 0 auto; border-radius: 6px;">
-        {cells_html}
-    </div>
-    <script>
-        const container = document.getElementById('game-container');
-        container.focus();
-        window.addEventListener('keydown', function(e) {{
-            if(["Space","ArrowUp","ArrowDown","ArrowLeft","ArrowRight"].indexOf(e.code) > -1) {{
-                e.preventDefault();
-            }}
-            let dir = "";
-            if (e.key === "ArrowUp" || e.key === "w") dir = "UP";
-            if (e.key === "ArrowDown" || e.key === "s") dir = "DOWN";
-            if (e.key === "ArrowLeft" || e.key === "a") dir = "LEFT";
-            if (e.key === "ArrowRight" || e.key === "d") dir = "RIGHT";
-            
-            if (dir !== "") {{
-                window.parent.postMessage({{type: 'streamlit:setComponentValue', value: dir}}, '*');
-            }}
-        }});
-    </script>
-    """
-    return html_code
+# ==========================================
+# STREAMLIT USER INTERFACE
+# ==========================================
 
 def main():
-    st.set_page_config(page_title="Streamlit Snake Game", page_icon="🐍", layout="centered")
-    
-    st.title("🐍 Classical Streamlit Snake Game")
-    st.markdown("Use your **Arrow Keys** or **W, A, S, D** to control the snake. Eat red food to grow and score points! Avoid walls and yourself.")
+    st.set_page_config(
+        page_title="CampusFind - Lost & Found",
+        page_icon="🎒",
+        layout="wide"
+    )
 
-    if "game" not in st.session_state:
-        st.session_state.game = SnakeGame()
+    db = CampusDatabase()
 
-    game: SnakeGame = st.session_state.game
+    # App Header
+    st.title("🎒 CampusFind — College Lost & Found Portal")
+    st.markdown("Welcome to the central hub for reporting, searching, and claiming lost items on campus.")
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Score", game.score)
-    col2.metric("Status", "Game Over 💀" if game.game_over else "Playing 🚀")
-    col3.metric("Snake Length", len(game.snake))
+    # Sidebar Navigation
+    st.sidebar.title("Navigation")
+    choice = st.sidebar.radio("Go to", ["Browse & Search", "Report Item", "Manage Claims / Status", "Dashboard Stats"])
 
-    # Render keyboard component
-    component_value = components.html(get_board_html(game), height=420, scrolling=False)
+    CATEGORIES = ["All", "Electronics", "Books & Notes", "ID & Cards", "Clothing", "Keys", "Bags", "Other"]
+    STATUSES = ["All", "Lost", "Found"]
 
-    # Control buttons fallback / manual triggers
-    st.markdown("### Manual Controls")
-    b1, b2, b3, b4 = st.columns(4)
-    if b1.button("⬆️ Up"):
-        game.change_direction("UP")
-        game.step()
-        st.rerun()
-    if b2.button("⬇️ Down"):
-        game.change_direction("DOWN")
-        game.step()
-        st.rerun()
-    if b3.button("⬅️ Left"):
-        game.change_direction("LEFT")
-        game.step()
-        st.rerun()
-    if b4.button("➡️ Right"):
-        game.change_direction("RIGHT")
-        game.step()
-        st.rerun()
+    if choice == "Browse & Search":
+        st.header("🔍 Browse & Search Lost/Found Items")
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            search_query = st.text_input("Search keywords", placeholder="e.g., iPhone, Calculator, Library...")
+        with col2:
+            selected_category = st.selectbox("Category", CATEGORIES)
+        with col3:
+            selected_status = st.selectbox("Item Status", STATUSES)
 
-    c_reset, c_step = st.columns(2)
-    if c_reset.button("🔄 Reset Game"):
-        game.reset()
-        st.rerun()
+        items = db.get_items(search_query=search_query, category=selected_category, status=selected_status)
 
-    if not game.game_over:
-        if c_step.button("⏩ Step Forward"):
-            game.step()
-            st.rerun()
+        st.markdown(f"**Found {len(items)} matching item(s)**")
+        st.divider()
 
-if __name__ == "__main__":
+        if not items:
+            st.info("No items found matching your criteria.")
+        else:
+            for item in items:
+                with st.container():
+                    cols = st.columns([3, 1, 1])
+                    with cols[0]:
+                        badge = "🔴 Lost" if item['status'] == 'Lost' else "🟢 Found"
+                        st.subheader(f"{badge}: {item['title']}")
+                        st.write(f"**Description:** {item['description']}")
+                        st.write(f"📍 **Location:** {item['location']} | 🏷️ **Category:** {item['category']} | 📅 **Date:** {item['date_reported']}")
+                    with cols[1]:
+                        st.write(f"**Reporter:**\n{item['reporter_name']}\n{item['reporter_contact']}")
+                    with cols[2]:
+                        claim_badge = f"📌 {item['claim_status']}"
+                        st.markdown(f"**Claim Status:**\n{claim_badge}")
+                        if item['claim_notes']:
+                            st.caption(f"Notes: {item['claim_notes']}")
+                    st.divider()
+
+    elif choice == "Report Item":
+        st.header("📢 Report a Lost or Found Item")
+        st.markdown("Please fill out the form accurately to help community members reconnect with their belongings.")
+
+        with st.form("report_form"):
+            col1, col2 = st.columns(2)
+            with col1:
+                title = st.text_input("Item Title*", placeholder="e.g., Blue Hydro Flask")
+                category = st.selectbox("Category", [c for c in CATEGORIES if c != "All"])
+                status = st.selectbox("Status", ["Lost", "Found"])
+                location = st.text_input("Location (Lost or Found)*", placeholder="e.g., Student Union 2nd Floor")
+            
+            with col2:
+                reporter_name = st.text_input("Your Name*", placeholder="e.g., Jane Doe")
+                reporter_contact = st.text_input("Your Email / Phone*", placeholder="e.g., jane@college.edu")
+                date_reported = st.date_input("Date", datetime.date.today())
+                description = st.text_area("Detailed Description*", placeholder="Color, brand, distinguishing marks...")
+
+            submitted = st.form_submit_button("Submit Report")
+
+            if submitted:
+                try:
+                    item_data = {
+                        "title": title,
+                        "description": description,
+                        "category": category,
+                        "status": status,
+                        "location": location,
+                        "date_reported": date_reported.isoformat(),
+                        "reporter_name": reporter_name,
+                        "reporter_contact": reporter_contact
+                    }
+                    db.add_item(item_data)
+                    st.success("✅ Item successfully reported and saved to database!")
+                except ValueError as e:
+                    st.error(f"❌ Error: {e}")
+
+    elif choice == "Manage Claims / Status":
+        st.header("🛠️ Manage Claim Status")
+        st.markdown("Update the claim status of items as they are returned to their owners.")
+
+        items = db.get_items()
+        if not items:
+            st.info("No items available in the system to manage.")
+        else:
+            item_options = {f"{i['id']}: {i['title']} ({i['status']})": i['id'] for i in items}
+            selected_option = st.selectbox("Select Item", list(item_options.keys()))
+            selected_id = item_options[selected_option]
+
+            current_item = next(i for i in items if i['id'] == selected_id)
+
+            with st.form("claim_form"):
+                st.write(f"**Current Claim Status:** {current_item['claim_status']}")
+                new_claim_status = st.selectbox("Update Claim Status", ["Unclaimed", "Pending Verification", "Claimed"])
+                new_claim_notes = st.text_area("Claim Notes / Handover Details", value=current_item['claim_notes'])
+                update_submitted = st.form_submit_button("Update Status")
+
+                if update_submitted:
+                    db.update_claim(selected_id, new_claim_status, new_claim_notes)
+                    st.success("✅ Claim status successfully updated!")
+                    st.rerun()
+
+    elif choice == "Dashboard Stats":
+        st.header("📊 Portal Analytics & Summary")
+        stats = db.get_stats()
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Items", stats["total"])
+        col2.metric("Lost Items Reported", stats["lost"])
+        col3.metric("Found Items Reported", stats["found"])
+        col4.metric("Successfully Claimed", stats["claimed"])
+
+        st.divider()
+        st.markdown("### Quick Guidelines")
+        st.markdown("""
+        - **Lost an Item?** File a report immediately with detailed identifiers.
+        - **Found an Item?** Drop it off at Campus Security or Student Services, and report it here.
+        - **Claiming:** Provide proof of ownership (student ID, serial number) when contacting the reporter or administrator.
+        """)
+
+if __name__ == '__main__':
     main()

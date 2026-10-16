@@ -1,6 +1,6 @@
 # Generated Application
 
-**Requirement:** Build a classical snake with well working controls from the keyboard and well visually understoobd by humans through the app and dont forget to make snake move without commands but also responds when command is given through arrows and make sure keyboard controls work
+**Requirement:** Build a functional web application called CampusFind — College Lost & Found Portal using Python and Streamlit with search, category filtering, persistent database, and claim reporting.
 
 **Format:** Streamlit Web App
 
