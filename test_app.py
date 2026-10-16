@@ -1,74 +1,76 @@
-import pytest
 import os
-import sqlite3
-from app import ArcadeDB, GameConfig, DB_FILE
+import pytest
+from app import GameEngine, DB_NAME, render_ping_pong_html
 
 @pytest.fixture(autouse=True)
-def setup_db():
+def setup_and_teardown():
     # Setup fresh DB for testing
-    if os.path.exists(DB_FILE):
-        os.remove(DB_FILE)
-    ArcadeDB.init_db()
+    if os.path.exists(DB_NAME):
+        os.remove(DB_NAME)
+    GameEngine.init_db()
     yield
-    if os.path.exists(DB_FILE):
-        os.remove(DB_FILE)
+    if os.path.exists(DB_NAME):
+        os.remove(DB_NAME)
 
-def test_database_initialization():
-    """Test that database and tables are correctly initialized."""
-    conn = ArcadeDB.get_connection()
+
+def test_init_db_creates_table():
+    conn = GameEngine.get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='high_scores'")
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='matches'")
     table = cursor.fetchone()
     conn.close()
     assert table is not None
+    assert table[0] == 'matches'
 
-def test_add_and_get_score():
-    """Test adding a score and retrieving the leaderboard."""
-    ArcadeDB.add_score("TestPlayer", 7, 3, "Normal")
-    leaderboard = ArcadeDB.get_leaderboard(limit=5)
-    
+
+def test_save_and_retrieve_match():
+    # Happy path test
+    success = GameEngine.save_match("TestUser", 5, 2, "Medium")
+    assert success is True
+
+    leaderboard = GameEngine.get_leaderboard()
     assert len(leaderboard) == 1
-    assert leaderboard[0]["player_name"] == "TestPlayer"
-    assert leaderboard[0]["score"] == 7
-    assert leaderboard[0]["ai_score"] == 3
-    assert leaderboard[0]["difficulty"] == "Normal"
+    assert leaderboard[0][0] == "TestUser"
+    assert leaderboard[0][1] == 5
+    assert leaderboard[0][2] == 2
+    assert leaderboard[0][3] == "Medium"
 
-def test_global_stats_increment():
-    """Test global match and points statistics tracking."""
-    stats_before = ArcadeDB.get_global_stats()
-    assert stats_before["total_matches"] == 0
-    assert stats_before["total_points_scored"] == 0
 
-    ArcadeDB.add_score(
-        player_name="Champ",
-        score=10,
-        ai_score=8,
-        difficulty="Hard"
-    )
+def test_save_match_empty_name_defaults_to_anonymous():
+    success = GameEngine.save_match("   ", 3, 5, "Hard")
+    assert success is True
 
-    stats_after = ArcadeDB.get_global_stats()
-    assert stats_after["total_matches"] == 1
-    assert stats_after["total_points_scored"] == 18
+    leaderboard = GameEngine.get_leaderboard()
+    assert leaderboard[0][0] == "Anonymous"
+
+
+def test_leaderboard_ordering():
+    GameEngine.save_match("PlayerLow", 2, 5, "Easy")
+    GameEngine.save_match("PlayerHigh", 5, 1, "Insane")
+    GameEngine.save_match("PlayerMid", 4, 3, "Medium")
+
+    leaderboard = GameEngine.get_leaderboard()
+    assert len(leaderboard) == 3
+    # Ordered by player_score DESC, then played_at DESC
+    assert leaderboard[0][0] == "PlayerHigh"
+    assert leaderboard[1][0] == "PlayerMid"
+    assert leaderboard[2][0] == "PlayerLow"
+
 
 def test_clear_database():
-    """Test clearing the database wipes scores and resets stats."""
-    ArcadeDB.add_score("RetroKing", 5, 1, "Easy")
-    assert len(ArcadeDB.get_leaderboard()) == 1
+    GameEngine.save_match("User1", 5, 0, "Easy")
+    assert len(GameEngine.get_leaderboard()) == 1
 
-    ArcadeDB.clear_database()
-    assert len(ArcadeDB.get_leaderboard()) == 0
-    stats = ArcadeDB.get_global_stats()
-    assert stats["total_matches"] == 0
+    cleared = GameEngine.clear_database()
+    assert cleared is True
+    assert len(GameEngine.get_leaderboard()) == 0
 
-def test_game_config_difficulties():
-    """Test that all game configuration levels are well-defined."""
-    assert "Easy" in GameConfig.DIFFICULTIES
-    assert "Normal" in GameConfig.DIFFICULTIES
-    assert "Hard" in GameConfig.DIFFICULTIES
-    assert "Extreme" in GameConfig.DIFFICULTIES
+
+def test_render_ping_pong_html_generation():
+    html_easy = render_ping_pong_html("Easy")
+    html_insane = render_ping_pong_html("Insane")
     
-    for diff, cfg in GameConfig.DIFFICULTIES.items():
-        assert "ai_speed" in cfg
-        assert "ball_speed" in cfg
-        assert "target_score" in cfg
-        assert cfg["target_score"] > 0
+    assert "canvas" in html_easy
+    assert "Easy" in html_easy
+    assert "Insane" in html_insane
+    assert "startGame()" in html_easy
