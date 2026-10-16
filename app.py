@@ -36,7 +36,22 @@ class CampusDatabase:
                 )
                 """
             )
+            # Self-healing schema migration: add any missing columns if migrating an older database
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(items)")
+            columns = [row[1] for row in cursor.fetchall()]
+            if "claim_status" not in columns:
+                cursor.execute("ALTER TABLE items ADD COLUMN claim_status TEXT DEFAULT 'Unclaimed'")
+            if "claim_notes" not in columns:
+                cursor.execute("ALTER TABLE items ADD COLUMN claim_notes TEXT DEFAULT ''")
             conn.commit()
+
+    def reset_db(self) -> None:
+        """Wipes all data and re-initializes fresh tables."""
+        with self._get_connection() as conn:
+            conn.execute("DROP TABLE IF EXISTS items")
+            conn.commit()
+        self._init_db()
 
     def add_item(self, data: Dict[str, Any]) -> int:
         required_fields = ['title', 'description', 'category', 'status', 'location', 'reporter_name', 'reporter_contact']
@@ -103,10 +118,18 @@ class CampusDatabase:
 
     def get_stats(self) -> Dict[str, int]:
         with self._get_connection() as conn:
-            total = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
-            lost = conn.execute("SELECT COUNT(*) FROM items WHERE status='Lost'").fetchone()[0]
-            found = conn.execute("SELECT COUNT(*) FROM items WHERE status='Found'").fetchone()[0]
-            claimed = conn.execute("SELECT COUNT(*) FROM items WHERE claim_status='Claimed'").fetchone()[0]
+            try:
+                total = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+                lost = conn.execute("SELECT COUNT(*) FROM items WHERE status='Lost'").fetchone()[0]
+                found = conn.execute("SELECT COUNT(*) FROM items WHERE status='Found'").fetchone()[0]
+                claimed = conn.execute("SELECT COUNT(*) FROM items WHERE claim_status='Claimed'").fetchone()[0]
+            except sqlite3.OperationalError:
+                # Self-heal schema if missing columns or tables
+                self._init_db()
+                total = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+                lost = conn.execute("SELECT COUNT(*) FROM items WHERE status='Lost'").fetchone()[0]
+                found = conn.execute("SELECT COUNT(*) FROM items WHERE status='Found'").fetchone()[0]
+                claimed = conn.execute("SELECT COUNT(*) FROM items WHERE claim_status='Claimed'").fetchone()[0]
             return {
                 "total": total,
                 "lost": lost,
@@ -134,6 +157,14 @@ def main():
     # Sidebar Navigation
     st.sidebar.title("Navigation")
     choice = st.sidebar.radio("Go to", ["Browse & Search", "Report Item", "Manage Claims / Status", "Dashboard Stats"])
+
+    st.sidebar.divider()
+    with st.sidebar.expander("⚙️ Database Management"):
+        st.caption("Clear stale test data or re-initialize a fresh database.")
+        if st.sidebar.button("🗑️ Reset Database / Clear All Data", use_container_width=True):
+            db.reset_db()
+            st.sidebar.success("Database wiped & schema re-initialized!")
+            st.rerun()
 
     CATEGORIES = ["All", "Electronics", "Books & Notes", "ID & Cards", "Clothing", "Keys", "Bags", "Other"]
     STATUSES = ["All", "Lost", "Found"]

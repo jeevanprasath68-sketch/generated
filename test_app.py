@@ -104,3 +104,52 @@ def test_update_claim(py_db):
 
     stats = py_db.get_stats()
     assert stats["claimed"] == 1
+
+def test_reset_db(py_db):
+    py_db.add_item({
+        "title": "Water Bottle",
+        "description": "Blue hydroflask",
+        "category": "Other",
+        "status": "Found",
+        "location": "Gym",
+        "reporter_name": "Coach",
+        "reporter_contact": "coach@college.edu"
+    })
+    assert len(py_db.get_items()) == 1
+    py_db.reset_db()
+    assert len(py_db.get_items()) == 0
+    assert py_db.get_stats()["total"] == 0
+
+def test_schema_migration_missing_columns(tmp_path):
+    import sqlite3
+    db_file = tmp_path / "legacy_items.db"
+    # Create legacy table WITHOUT claim_status or claim_notes
+    conn = sqlite3.connect(str(db_file))
+    conn.execute("""
+        CREATE TABLE items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            description TEXT,
+            category TEXT,
+            status TEXT,
+            location TEXT,
+            date_reported TEXT,
+            reporter_name TEXT,
+            reporter_contact TEXT
+        )
+    """)
+    conn.execute("""
+        INSERT INTO items (title, description, category, status, location, date_reported, reporter_name, reporter_contact)
+        VALUES ('Old Item', 'Desc', 'Other', 'Lost', 'Hall', '2026-01-01', 'John', 'john@test.com')
+    """)
+    conn.commit()
+    conn.close()
+
+    # Now load it with CampusDatabase, it must self-heal and not throw OperationalError!
+    db = CampusDatabase(db_path=str(db_file))
+    stats = db.get_stats()
+    assert stats["total"] == 1
+    assert stats["claimed"] == 0
+    items = db.get_items()
+    assert len(items) == 1
+    assert items[0]["claim_status"] == "Unclaimed"
