@@ -1,272 +1,443 @@
 import streamlit as st
-import json
-import random
-from typing import Dict, Tuple, Any
+import streamlit.components.v1 as components
+import sqlite3
+import datetime
+from typing import Dict, Any, List, Optional
 
-# --- BUSINESS LOGIC & GAME ENGINE ---
+# ==========================================
+# BUSINESS LOGIC & DATA ENGINE
+# ==========================================
+
+DB_NAME = "ping_pong_scores.db"
+
+def _get_db_connection():
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def _init_db() -> None:
+    """Initialize database and self-heal missing columns if schema evolves."""
+    conn = _get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS match_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_score INTEGER NOT NULL,
+            ai_score INTEGER NOT NULL,
+            difficulty TEXT NOT NULL,
+            winner TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    
+    # Self-healing column check
+    cursor.execute("PRAGMA table_info(match_history)")
+    columns = [col["name"] for col in cursor.fetchall()]
+    if "difficulty" not in columns:
+        cursor.execute("ALTER TABLE match_history ADD COLUMN difficulty TEXT DEFAULT 'Medium'")
+        conn.commit()
+    conn.close()
 
 class GameEngine:
-    def __init__(self, width: int = 800, height: int = 500):
-        self.width = width
-        self.height = height
-        self.reset()
-
-    def reset(self):
-        self.ball_x = self.width / 2
-        self.ball_y = self.height / 2
-        # Random initial angle with moderate speed
-        angle = random.uniform(-0.5, 0.5)
-        direction = random.choice([-1, 1])
-        speed = 5.0
-        self.ball_vx = speed * direction
-        self.ball_vy = speed * angle
+    """Handles business logic for game statistics and rules."""
+    
+    @staticmethod
+    def record_match(player_score: int, ai_score: int, difficulty: str) -> Dict[str, Any]:
+        _init_db()
+        winner = "Player" if player_score > ai_score else ("AI" if ai_score > player_score else "Tie")
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        self.paddle_h = 100
-        self.paddle_w = 15
-        
-        # Player (Left paddle)
-        self.player_y = self.height / 2 - self.paddle_h / 2
-        self.player_score = 0
-        
-        # AI (Right paddle)
-        self.ai_y = self.height / 2 - self.paddle_h / 2
-        self.ai_score = 0
-        
-        self.game_over = False
-        self.winner = None
+        conn = _get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO match_history (player_score, ai_score, difficulty, winner, timestamp) VALUES (?, ?, ?, ?, ?)",
+            (player_score, ai_score, difficulty, winner, timestamp)
+        )
+        conn.commit()
+        conn.close()
+        return {"player_score": player_score, "ai_score": ai_score, "winner": winner, "timestamp": timestamp}
 
-    def update(self, player_move: str, ai_difficulty: float) -> Dict[str, Any]:
-        if self.game_over:
-            return self.get_state()
+    @staticmethod
+    def get_leaderboard(limit: int = 10) -> List[Dict[str, Any]]:
+        _init_db()
+        try:
+            conn = _get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT player_score, ai_score, difficulty, winner, timestamp FROM match_history ORDER BY id DESC LIMIT ?",
+                (limit,)
+            )
+            rows = cursor.fetchall()
+            conn.close()
+            return [dict(row) for row in rows]
+        except sqlite3.OperationalError:
+            _init_db()
+            return []
 
-        # Check scoring immediately if ball is already out of bounds (useful for tests)
-        if self.ball_x < 0:
-            self.ai_score += 1
-            self._check_win_condition()
-            if not self.game_over:
-                self._reset_ball(direction=1)
-            return self.get_state()
-        elif self.ball_x > self.width:
-            self.player_score += 1
-            self._check_win_condition()
-            if not self.game_over:
-                self._reset_ball(direction=-1)
-            return self.get_state()
+    @staticmethod
+    def clear_database() -> None:
+        conn = _get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DROP TABLE IF EXISTS match_history")
+        conn.commit()
+        conn.close()
+        _init_db()
 
-        # Player movement
-        move_speed = 15.0
-        if player_move == "UP":
-            self.player_y = max(0.0, self.player_y - move_speed)
-        elif player_move == "DOWN":
-            self.player_y = min(float(self.height - self.paddle_h), self.player_y + move_speed)
-
-        # AI movement
-        target_y = self.ball_y - self.paddle_h / 2
-        error_margin = (1.0 - ai_difficulty) * 60.0
-        target_y += random.uniform(-error_margin, error_margin)
-        ai_speed = 4.0 + (ai_difficulty * 4.0)
-        if self.ai_y < target_y:
-            self.ai_y = min(float(self.height - self.paddle_h), self.ai_y + ai_speed)
-        elif self.ai_y > target_y:
-            self.ai_y = max(0.0, self.ai_y - ai_speed)
-
-        # Ball movement
-        self.ball_x += self.ball_vx
-        self.ball_y += self.ball_vy
-
-        # Wall collisions (Top / Bottom)
-        if self.ball_y <= 10:
-            self.ball_y = 10
-            self.ball_vy *= -1
-        elif self.ball_y >= self.height - 10:
-            self.ball_y = self.height - 10
-            self.ball_vy *= -1
-
-        # Paddle collisions (Player - Left)
-        if self.ball_x <= 30 and (self.player_y <= self.ball_y <= self.player_y + self.paddle_h):
-            self.ball_x = 30
-            offset = (self.ball_y - (self.player_y + self.paddle_h / 2)) / (self.paddle_h / 2)
-            speed = min(15.0, (self.ball_vx**2 + self.ball_vy**2)**0.5 * 1.05)
-            angle = offset * 0.75
-            self.ball_vx = speed * (1 - angle**2)**0.5
-            self.ball_vy = speed * angle
-            if self.ball_vx < 0:
-                self.ball_vx *= -1
-
-        # Paddle collisions (AI - Right)
-        if self.ball_x >= self.width - 30 and (self.ai_y <= self.ball_y <= self.ai_y + self.paddle_h):
-            self.ball_x = self.width - 30
-            offset = (self.ball_y - (self.ai_y + self.paddle_h / 2)) / (self.paddle_h / 2)
-            speed = min(15.0, (self.ball_vx**2 + self.ball_vy**2)**0.5 * 1.05)
-            angle = -speed * (1 - angle**2)**0.5
-            self.ball_vx = angle
-            self.ball_vy = speed * offset * 0.75
-            if self.ball_vx > 0:
-                self.ball_vx *= -1
-
-        # Scoring after movement
-        if self.ball_x < 0:
-            self.ai_score += 1
-            self._check_win_condition()
-            if not self.game_over:
-                self._reset_ball(direction=1)
-        elif self.ball_x > self.width:
-            self.player_score += 1
-            self._check_win_condition()
-            if not self.game_over:
-                self._reset_ball(direction=-1)
-
-        return self.get_state()
-
-    def _reset_ball(self, direction: int):
-        self.ball_x = self.width / 2
-        self.ball_y = self.height / 2
-        angle = random.uniform(-0.4, 0.4)
-        speed = 5.0
-        self.ball_vx = speed * direction
-        self.ball_vy = speed * angle
-
-    def _check_win_condition(self):
-        winning_score = 5
-        if self.player_score >= winning_score:
-            self.game_over = True
-            self.winner = "Player"
-        elif self.ai_score >= winning_score:
-            self.game_over = True
-            self.winner = "AI"
-
-    def get_state(self) -> Dict[str, Any]:
-        return {
-            "ball_x": self.ball_x,
-            "ball_y": self.ball_y,
-            "player_y": self.player_y,
-            "ai_y": self.ai_y,
-            "player_score": self.player_score,
-            "ai_score": self.ai_score,
-            "game_over": self.game_over,
-            "winner": self.winner,
-            "width": self.width,
-            "height": self.height
+    @staticmethod
+    def calculate_ai_speed(difficulty: str) -> float:
+        mapping = {
+            "Easy": 0.05,
+            "Medium": 0.08,
+            "Hard": 0.12,
+            "Insane": 0.18
         }
+        if difficulty not in mapping:
+            raise ValueError(f"Invalid difficulty: {difficulty}")
+        return mapping[difficulty]
 
-# --- STREAMLIT UI ---
-
-st.set_page_config(page_title="Retro Ping Pong AI", page_icon="🏓", layout="centered")
+# ==========================================
+# STREAMLIT UI & EMBEDDED RETRO GAME
+# ==========================================
 
 def main():
-    st.markdown("<h1 style='text-align: center; color: #ff4b4b;'>🏓 RETRO PING PONG: PLAYER vs AI</h1>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align: center; color: #a1a1a1;'>Use the On-Screen buttons or Keyboard (W/S or Up/Down arrows) to defeat the AI!</p>", unsafe_allow_html=True)
+    st.set_page_config(
+        page_title="Retro Arcade Ping Pong",
+        page_icon="🏓",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
 
-    # Initialize session state for game engine
-    if "game" not in st.session_state:
-        st.session_state.game = GameEngine()
-    if "difficulty" not in st.session_state:
-        st.session_state.difficulty = 0.5
-    if "auto_play" not in st.session_state:
-        st.session_state.auto_play = False
+    _init_db()
 
-    game = st.session_state.game
+    st.title("🏓 Retro Arcade Ping Pong")
+    st.markdown(
+        "Welcome to the classic **Ping Pong** arcade! Use your keyboard arrow keys or W/S to control the left paddle. "
+        "Defeat the AI opponent and check out your match history below!"
+    )
 
-    # Sidebar controls
-    with st.sidebar:
-        st.header("⚙️ Game Settings")
-        st.session_state.difficulty = st.slider("🤖 AI Difficulty", 0.1, 1.0, 0.5, 0.1,
-                                                 help="Higher difficulty makes the AI faster and more precise.")
-        
-        if st.button("🔄 Reset Match", use_container_width=True):
-            game.reset()
-            st.rerun()
-
-        st.markdown("---")
-        st.markdown("### 📊 Match Statistics")
-        state = game.get_state()
-        st.metric(label="Your Score", value=state["player_score"])
-        st.metric(label="AI Score", value=state["ai_score"])
-        if state["game_over"]:
-            st.success(f"🏆 Winner: {state['winner']}!")
-
-    # Handle user action triggers via buttons
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col1:
-        if st.button("⬆️ UP", use_container_width=True):
-            game.update("UP", st.session_state.difficulty)
-            st.rerun()
-    with col2:
-        if st.button("⏸️ PAUSE / STEP", use_container_width=True):
-            game.update("NONE", st.session_state.difficulty)
-            st.rerun()
-    with col3:
-        if st.button("⬇️ DOWN", use_container_width=True):
-            game.update("DOWN", st.session_state.difficulty)
-            st.rerun()
-
-    # Render HTML Canvas and keyboard event listener
-    current_state = game.get_state()
-    state_json = json.dumps(current_state)
-
-    canvas_html = f"""
-    <div style="display: flex; justify-content: center; background-color: #0e1117; padding: 10px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.5);">
-        <canvas id="pingPongCanvas" width="{current_state['width']}" height="{current_state['height']}" style="background: #1a1c23; border-radius: 8px;"></canvas>
-    </div>
-    <script>
-        const canvas = document.getElementById('pingPongCanvas');
-        const ctx = canvas.getContext('2d');
-        let gameState = {state_json};
-
-        function draw() {{
-            ctx.fillStyle = '#1a1c23';
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-            ctx.strokeStyle = '#3a3f4b';
-            ctx.lineWidth = 4;
-            ctx.setLineDash([10, 10]);
-            ctx.beginPath();
-            ctx.moveTo(canvas.width / 2, 0);
-            ctx.lineTo(canvas.width / 2, canvas.height);
-            ctx.stroke();
-            ctx.setLineDash([]);
-
-            ctx.fillStyle = '#00f0ff';
-            ctx.shadowBlur = 15;
-            ctx.shadowColor = '#00f0ff';
-            ctx.fillRect(20, gameState.player_y, 15, 100);
-
-            ctx.fillStyle = '#ff007f';
-            ctx.shadowColor = '#ff007f';
-            ctx.fillRect(canvas.width - 35, gameState.ai_y, 15, 100);
-
-            ctx.fillStyle = '#ffcc00';
-            ctx.shadowColor = '#ffcc00';
-            ctx.beginPath();
-            ctx.arc(gameState.ball_x, gameState.ball_y, 10, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.shadowBlur = 0;
-
-            ctx.font = 'bold 48px monospace';
-            ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
-            ctx.textAlign = 'center';
-            ctx.fillText(gameState.player_score, canvas.width / 4, 70);
-            ctx.fillText(gameState.ai_score, (canvas.width / 4) * 3, 70);
-
-            if (gameState.game_over) {{
-                ctx.fillStyle = 'rgba(0, 0, 0, 0.75)';
-                ctx.fillRect(0, 0, canvas.width, canvas.height);
-                ctx.font = 'bold 36px sans-serif';
-                ctx.fillStyle = '#00ffcc';
-                ctx.fillText("GAME OVER - WINNER: " + gameState.winner, canvas.width / 2, canvas.height / 2);
-            }}
-        }}
-        draw();
-    </script>
-    """
-
-    st.markdown(canvas_html, unsafe_allow_html=True)
-
-    if not current_state["game_over"]:
-        import time
-        time.sleep(0.03)
-        game.update("NONE", st.session_state.difficulty)
+    # Sidebar Configuration
+    st.sidebar.header("⚙️ Game Settings")
+    difficulty = st.sidebar.selectbox("AI Difficulty", ["Easy", "Medium", "Hard", "Insane"], index=1)
+    winning_score = st.sidebar.slider("Winning Score Target", min_value=3, max_value=21, value=5)
+    
+    st.sidebar.divider()
+    st.sidebar.subheader("🛠️ Maintenance")
+    if st.sidebar.button("Reset All Game Data", type="secondary"):
+        GameEngine.clear_database()
+        st.sidebar.success("Database successfully reset!")
         st.rerun()
 
-if __name__ == "__main__":
+    # Get AI speed factor
+    ai_speed = GameEngine.calculate_ai_speed(difficulty)
+
+    col1, col2 = st.sidebar.columns(2)
+    with col1:
+        st.metric(label="Difficulty", value=difficulty)
+    with col2:
+        st.metric(label="Target", value=winning_score)
+
+    # HTML / CSS / JS Embedded Game Component
+    # We pass AI speed and winning score via template strings into the JS engine.
+    game_html = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Ping Pong Arcade</title>
+        <style>
+            body {{
+                background-color: #0d1117;
+                color: #58a6ff;
+                font-family: 'Courier New', Courier, monospace;
+                text-align: center;
+                margin: 0;
+                padding: 0;
+                overflow: hidden;
+            }};
+            #game-container {{
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                height: 100vh;
+            }}
+            canvas {{
+                background: #000000;
+                border: 4px solid #30363d;
+                box-shadow: 0 0 25px rgba(88, 166, 255, 0.3);
+                border-radius: 6px;
+            }}
+            .ui-panel {{
+                margin-top: 10px;
+                font-size: 18px;
+                font-weight: bold;
+            }}
+            .btn {{
+                background-color: #238636;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                font-size: 16px;
+                font-family: 'Courier New', Courier, monospace;
+                border-radius: 4px;
+                cursor: pointer;
+                margin-top: 10px;
+                box-shadow: 0 4px #2ea043;
+            }}
+            .btn:active {{
+                background-color: #2ea043;
+                box-shadow: 0 2px #2ea043;
+                transform: translateY(2px);
+            }}
+        </style>
+    </head>
+    <body>
+        <div id="game-container">
+            <canvas id="pong" width="750" height="450"></canvas>
+            <div class="ui-panel" id="status-text">Press Start to Play! (Controls: W/S or Arrow Keys)</div>
+            <button class="btn" id="start-btn" onclick="startGame()">START / RESTART</button>
+        </div>
+
+        <script>
+            const canvas = document.getElementById("pong");
+            const ctx = canvas.getContext("2d");
+            const statusText = document.getElementById("status-text");
+
+            const aiSpeedFactor = {ai_speed};
+            const targetScore = {winning_score};
+
+            let gameRunning = false;
+
+            // Paddle setup
+            const paddleWidth = 12;
+            const paddleHeight = 90;
+
+            let player = {{
+                x: 10,
+                y: canvas.height / 2 - paddleHeight / 2,
+                width: paddleWidth,
+                height: paddleHeight,
+                score: 0,
+                color: "#58a6ff"
+            }};
+
+            let ai = {{
+                x: canvas.width - 22,
+                y: canvas.height / 2 - paddleHeight / 2,
+                width: paddleWidth,
+                height: paddleHeight,
+                score: 0,
+                color: "#ff7b72"
+            }};
+
+            // Ball setup
+            let ball = {{
+                x: canvas.width / 2,
+                y: canvas.height / 2,
+                radius: 10,
+                speed: 5,
+                velocityX: 5,
+                velocityY: 5,
+                color: "#f0f6fc"
+            }};
+
+            // Keyboard tracking
+            let keys = {{}};
+            window.addEventListener('keydown', (e) => {{
+                keys[e.key] = true;
+                if(["ArrowUp", "ArrowDown", " ", "w", "s", "W", "S"].includes(e.key)) {{
+                    e.preventDefault();
+                }};
+            }});
+            window.addEventListener('keyup', (e) => {{
+                keys[e.key] = false;
+            }});
+
+            function drawRect(x, y, w, h, color) {{
+                ctx.fillStyle = color;
+                ctx.fillRect(x, y, w, h);
+            }}
+
+            function drawCircle(x, y, r, color) {{
+                ctx.fillStyle = color;
+                ctx.beginPath();
+                ctx.arc(x, y, r, 0, Math.PI * 2, false);
+                ctx.closePath();
+                ctx.fill();
+            }}
+
+            function drawText(text, x, y, color, font = "20px 'Courier New'") {{
+                ctx.fillStyle = color;
+                ctx.font = font;
+                ctx.fillText(text, x, y);
+            }}
+
+            function drawNet() {{
+                for (let i = 0; i <= canvas.height; i += 15) {{
+                    drawRect(canvas.width / 2 - 1, i, 2, 10, "#30363d");
+                }}
+            }}
+
+            function resetBall() {{
+                ball.x = canvas.width / 2;
+                ball.y = canvas.height / 2;
+                ball.speed = 5;
+                ball.velocityX = -ball.velocityX;
+            }}
+
+            function collision(b, p) {{
+                b.top = b.y - b.radius;
+                b.bottom = b.y + b.radius;
+                b.left = b.x - b.radius;
+                b.right = b.x + b.radius;
+
+                p.top = p.y;
+                p.bottom = p.y + p.height;
+                p.left = p.x;
+                p.right = p.x + p.width;
+
+                return b.right > p.left && b.bottom > p.top && b.left < p.right && b.top < p.bottom;
+            }}
+
+            function update() {{
+                if (!gameRunning) return;
+
+                // Player movement
+                if ((keys['ArrowUp'] || keys['w'] || keys['W']) && player.y > 0) {{
+                    player.y -= 7;
+                }} else if ((keys['ArrowDown'] || keys['s'] || keys['S']) && player.y < canvas.height - player.height) {{
+                    player.y += 7;
+                }}
+
+                // AI simple tracking
+                let aiTarget = ball.y - (ai.height / 2);
+                ai.y += (aiTarget - ai.y) * aiSpeedFactor;
+                if (ai.y < 0) ai.y = 0;
+                if (ai.y > canvas.height - ai.height) ai.y = canvas.height - ai.height;
+
+                // Move ball
+                ball.x += ball.velocityX;
+                ball.y += ball.velocityY;
+
+                // Wall collision (top & bottom)
+                if (ball.y - ball.radius < 0 || ball.y + ball.radius > canvas.height) {{
+                    ball.velocityY = -ball.velocityY;
+                }}
+
+                // Determine active paddle for collision
+                let activePaddle = (ball.x < canvas.width / 2) ? player : ai;
+
+                if (collision(ball, activePaddle)) {{
+                    // Calculate hit point
+                    let collidePoint = ball.y - (activePaddle.y + activePaddle.height / 2);
+                    collidePoint = collidePoint / (activePaddle.height / 2);
+
+                    let angleRad = (Math.PI / 4) * collidePoint;
+                    let direction = (ball.x < canvas.width / 2) ? 1 : -1;
+
+                    ball.velocityX = direction * ball.speed * Math.cos(angleRad);
+                    ball.velocityY = ball.speed * Math.sin(angleRad);
+
+                    ball.speed += 0.3; // Incremental speed boost
+                }}
+
+                // Scoring
+                if (ball.x - ball.radius < 0) {{
+                    ai.score++;
+                    checkWinCondition();
+                }} else if (ball.x + ball.radius > canvas.width) {{
+                    player.score++;
+                    checkWinCondition();
+                }}
+            }}
+
+            function checkWinCondition() {{
+                if (player.score >= targetScore || ai.score >= targetScore) {{
+                    gameRunning = false;
+                    let winnerName = player.score >= targetScore ? "PLAYER WINS! 🏆" : "AI WINS! 🤖";
+                    statusText.innerHTML = `Game Over! ${winnerName} Final Score: ${player.score} - ${ai.score}`;
+                    
+                    // Send score back to Streamlit via URL fetch or event simulation if required
+                    // For simplicity, we trigger visual notification
+                }} else {{
+                    resetBall();
+                }}
+            }}
+
+            function render() {{
+                // Clear canvas
+                drawRect(0, 0, canvas.width, canvas.height, "#000000");
+                drawNet();
+
+                // Draw scores
+                drawText(player.score, canvas.width / 4, canvas.height / 5, "#58a6ff", "50px 'Courier New'");
+                drawText(ai.score, 3 * canvas.width / 4, canvas.height / 5, "#ff7b72", "50px 'Courier New'");
+
+                // Draw paddles & ball
+                drawRect(player.x, player.y, player.width, player.height, player.color);
+                drawRect(ai.x, ai.y, ai.width, ai.height, ai.color);
+                drawCircle(ball.x, ball.y, ball.radius, ball.color);
+            }}
+
+            function gameLoop() {{
+                update();
+                render();
+                if (gameRunning) {{
+                    requestAnimationFrame(gameLoop);
+                }}
+            }}
+
+            function startGame() {{
+                player.score = 0;
+                ai.score = 0;
+                player.y = canvas.height / 2 - paddleHeight / 2;
+                ai.y = canvas.height / 2 - paddleHeight / 2;
+                resetBall();
+                gameRunning = true;
+                statusText.innerHTML = "Match in progress... Good luck!";
+                gameLoop();
+            }}
+
+            // Initial render
+            render();
+        </script>
+    </body>
+    </html>
+    """
+
+    components.html(game_html, height=580, scrolling=False)
+
+    # Match Logging Section
+    st.divider()
+    st.subheader("📝 Manual Match Log & History")
+    st.markdown("Log completed match results here to track your lifetime arcade stats against the AI!")
+
+    with st.form("match_log_form"):
+        col_f1, col_f2, col_f3 = st.columns(3)
+        with col_f1:
+            p_score_input = st.number_input("Your Score", min_value=0, max_value=30, value=5)
+        with col_f2:
+            ai_score_input = st.number_input("AI Score", min_value=0, max_value=30, value=2)
+        with col_f3:
+            diff_input = st.selectbox("Recorded Difficulty", ["Easy", "Medium", "Hard", "Insane"], index=1)
+        
+        submit_match = st.form_submit_button("Save Match Result")
+        if submit_match:
+            res = GameEngine.record_match(p_score_input, ai_score_input, diff_input)
+            st.success(f"Match saved successfully! Winner: {res['winner']} ({res['player_score']} - {res['ai_score']})")
+
+    # Display Match History
+    st.subheader("📊 Recent Match Leaderboard")
+    history = GameEngine.get_leaderboard(limit=10)
+    if history:
+        st.dataframe(history, use_container_width=True)
+    else:
+        st.info(
+            "No match history recorded yet. Play a match or record one above to build your arcade legacy!"
+        )
+
+if __name__ == '__main__':
     main()
