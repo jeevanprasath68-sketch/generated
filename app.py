@@ -1,551 +1,272 @@
 import streamlit as st
-import streamlit.components.v1 as components
-import sqlite3
 import json
-from datetime import datetime
-from typing import Dict, Any, List
+import random
+from typing import Dict, Tuple, Any
 
-# ==========================================
-# BUSINESS LOGIC & DATABASE ENGINE
-# ==========================================
+# --- BUSINESS LOGIC & GAME ENGINE ---
 
-DB_NAME = "ping_pong_scores.db"
+class GameEngine:
+    def __init__(self, width: int = 800, height: int = 500):
+        self.width = width
+        self.height = height
+        self.reset()
 
-def _init_db():
-    """Initializes SQLite database with automatic schema migration and self-healing."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS matches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            player_name TEXT NOT NULL,
-            player_score INTEGER NOT NULL,
-            ai_score INTEGER NOT NULL,
-            difficulty TEXT NOT NULL,
-            timestamp TEXT NOT NULL
-        )
-    ''')
-    
-    # Schema migration check: ensure all columns exist
-    cursor.execute("PRAGMA table_info(matches)")
-    columns = [col[1] for col in cursor.fetchall()]
-    
-    if "player_name" not in columns:
-        cursor.execute("ALTER TABLE matches ADD COLUMN player_name TEXT NOT NULL DEFAULT 'Player'")
-    if "player_score" not in columns:
-        cursor.execute("ALTER TABLE matches ADD COLUMN player_score INTEGER NOT NULL DEFAULT 0")
-    if "ai_score" not in columns:
-        cursor.execute("ALTER TABLE matches ADD COLUMN ai_score INTEGER NOT NULL DEFAULT 0")
-    if "difficulty" not in columns:
-        cursor.execute("ALTER TABLE matches ADD COLUMN difficulty TEXT NOT NULL DEFAULT 'Medium'")
-    if "timestamp" not in columns:
-        cursor.execute("ALTER TABLE matches ADD COLUMN timestamp TEXT NOT NULL DEFAULT ''")
+    def reset(self):
+        self.ball_x = self.width / 2
+        self.ball_y = self.height / 2
+        # Random initial angle with moderate speed
+        angle = random.uniform(-0.5, 0.5)
+        direction = random.choice([-1, 1])
+        speed = 5.0
+        self.ball_vx = speed * direction
+        self.ball_vy = speed * angle
         
-    conn.commit()
-    conn.close()
+        self.paddle_h = 100
+        self.paddle_w = 15
+        
+        # Player (Left paddle)
+        self.player_y = self.height / 2 - self.paddle_h / 2
+        self.player_score = 0
+        
+        # AI (Right paddle)
+        self.ai_y = self.height / 2 - self.paddle_h / 2
+        self.ai_score = 0
+        
+        self.game_over = False
+        self.winner = None
 
-class PingPongEngine:
-    """Handles business logic for game state evaluation, scoring, and score persistence."""
-    
-    @staticmethod
-    def save_match(player_name: str, player_score: int, ai_score: int, difficulty: str) -> bool:
-        try:
-            _init_db()
-            conn = sqlite3.connect(DB_NAME)
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO matches (player_name, player_score, ai_score, difficulty, timestamp) VALUES (?, ?, ?, ?, ?)",
-                (player_name, player_score, ai_score, difficulty, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            )
-            conn.commit()
-            conn.close()
-            return True
-        except Exception as e:
-            print(f"Database Error: {e}")
-            return False
+    def update(self, player_move: str, ai_difficulty: float) -> Dict[str, Any]:
+        if self.game_over:
+            return self.get_state()
 
-    @staticmethod
-    def get_leaderboard() -> List[Dict[str, Any]]:
-        try:
-            _init_db()
-            conn = sqlite3.connect(DB_NAME)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM matches ORDER BY player_score DESC, timestamp DESC LIMIT 10")
-            rows = cursor.fetchall()
-            conn.close()
-            return [dict(row) for row in rows]
-        except Exception as e:
-            print(f"Leaderboard Error: {e}")
-            return []
+        # Check scoring immediately if ball is already out of bounds (useful for tests)
+        if self.ball_x < 0:
+            self.ai_score += 1
+            self._check_win_condition()
+            if not self.game_over:
+                self._reset_ball(direction=1)
+            return self.get_state()
+        elif self.ball_x > self.width:
+            self.player_score += 1
+            self._check_win_condition()
+            if not self.game_over:
+                self._reset_ball(direction=-1)
+            return self.get_state()
 
-    @staticmethod
-    def reset_database() -> bool:
-        try:
-            conn = sqlite3.connect(DB_NAME)
-            cursor = conn.cursor()
-            cursor.execute("DROP TABLE IF EXISTS matches")
-            conn.commit()
-            conn.close()
-            _init_db()
-            return True
-        except Exception as e:
-            print(f"Reset DB Error: {e}")
-            return False
+        # Player movement
+        move_speed = 15.0
+        if player_move == "UP":
+            self.player_y = max(0.0, self.player_y - move_speed)
+        elif player_move == "DOWN":
+            self.player_y = min(float(self.height - self.paddle_h), self.player_y + move_speed)
 
-# ==========================================
-# HTML5 / CANVAS GAME COMPONENT
-# ==========================================
+        # AI movement
+        target_y = self.ball_y - self.paddle_h / 2
+        error_margin = (1.0 - ai_difficulty) * 60.0
+        target_y += random.uniform(-error_margin, error_margin)
+        ai_speed = 4.0 + (ai_difficulty * 4.0)
+        if self.ai_y < target_y:
+            self.ai_y = min(float(self.height - self.paddle_h), self.ai_y + ai_speed)
+        elif self.ai_y > target_y:
+            self.ai_y = max(0.0, self.ai_y - ai_speed)
 
-def render_game_canvas(difficulty: str, target_score: int, player_name: str):
-    """Renders the interactive HTML5/JS canvas ping pong game inside Streamlit."""
-    
-    # Map difficulty to AI speed multiplier
-    ai_speed_map = {"Easy": 0.04, "Medium": 0.07, "Hard": 0.11, "Expert": 0.16}
-    ai_speed = ai_speed_map.get(difficulty, 0.07)
-    
-    html_code = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <style>
-            body {{
-                margin: 0;
-                background: #0f172a;
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                color: white;
-                overflow: hidden;
-            }} 
-            #game-container {{
-                position: relative;
-                box-shadow: 0 10px 25px rgba(0,0,0,0.5);
-                border-radius: 12px;
-                overflow: hidden;
-                border: 2px solid #334155;
-            }} 
-            canvas {{
-                display: block;
-                background: #1e293b;
-            }}
-            .ui-panel {{
-                display: flex;
-                justify-content: space-between;
-                width: 100%;
-                max-width: 600px;
-                margin-bottom: 10px;
-                font-weight: bold;
-                font-size: 16px;
-            }}
-            .score-box {{
-                background: #334155;
-                padding: 6px 16px;
-                border-radius: 8px;
-            }}
-            #game-over-modal {{
-                position: absolute;
-                top: 0;
-                left: 0;
-                width: 100%;
-                height: 100%;
-                background: rgba(15, 23, 42, 0.85);
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                text-align: center;
-                display: none;
-                z-index: 10;
-            }} 
-            .btn {{
-                background: #6366f1;
-                color: white;
-                border: none;
-                padding: 10px 24px;
-                font-size: 16px;
-                font-weight: bold;
-                border-radius: 6px;
-                cursor: pointer;
-                margin-top: 15px;
-                transition: background 0.2s;
-            }}
-            .btn:hover {{
-                background: #4f46e5;
-            }}
-            .mobile-controls {{
-                display: none;
-                justify-content: space-between;
-                width: 100%;
-                max-width: 600px;
-                margin-top: 10px;
-            }} 
-            .mob-btn {{
-                background: #334155;
-                color: white;
-                border: none;
-                padding: 15px 30px;
-                font-size: 20px;
-                border-radius: 8px;
-                flex: 1;
-                margin: 0 5px;
-                cursor: pointer;
-            }}
-            @media (max-width: 768px) {{
-                .mobile-controls {{ display: flex; }}
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="ui-panel">
-            <div class="score-box">{player_name}: <span id="playerScore">0</span></div>
-            <div class="score-box">AI ({difficulty}): <span id="aiScore">0</span></div>
-        </div>
+        # Ball movement
+        self.ball_x += self.ball_vx
+        self.ball_y += self.ball_vy
 
-        <div id="game-container">
-            <canvas id="pongCanvas" width="600" height="400"></canvas>
-            <div id="game-over-modal">
-                <h1 id="modal-title" style="margin: 0 0 10px 0; color: #38bdf8;">Game Over</h1>
-                <p id="modal-desc" style="margin: 0; color: #94a3b8;">Final Score</p>
-                <button class="btn" onclick="restartGame()">Play Again</button>
-            </div>
-        </div>
+        # Wall collisions (Top / Bottom)
+        if self.ball_y <= 10:
+            self.ball_y = 10
+            self.ball_vy *= -1
+        elif self.ball_y >= self.height - 10:
+            self.ball_y = self.height - 10
+            self.ball_vy *= -1
 
-        <div class="mobile-controls">
-            <button class="mob-btn" ontouchstart="moveUp()" onmousedown="moveUp()">⬆️ Up</button>
-            <button class="mob-btn" ontouchstart="moveDown()" onmousedown="moveDown()">⬇️ Down</button>
-        </div>
+        # Paddle collisions (Player - Left)
+        if self.ball_x <= 30 and (self.player_y <= self.ball_y <= self.player_y + self.paddle_h):
+            self.ball_x = 30
+            offset = (self.ball_y - (self.player_y + self.paddle_h / 2)) / (self.paddle_h / 2)
+            speed = min(15.0, (self.ball_vx**2 + self.ball_vy**2)**0.5 * 1.05)
+            angle = offset * 0.75
+            self.ball_vx = speed * (1 - angle**2)**0.5
+            self.ball_vy = speed * angle
+            if self.ball_vx < 0:
+                self.ball_vx *= -1
 
-        <script>
-            const canvas = document.getElementById('pongCanvas');
-            const ctx = canvas.getContext('2d');
+        # Paddle collisions (AI - Right)
+        if self.ball_x >= self.width - 30 and (self.ai_y <= self.ball_y <= self.ai_y + self.paddle_h):
+            self.ball_x = self.width - 30
+            offset = (self.ball_y - (self.ai_y + self.paddle_h / 2)) / (self.paddle_h / 2)
+            speed = min(15.0, (self.ball_vx**2 + self.ball_vy**2)**0.5 * 1.05)
+            angle = -speed * (1 - angle**2)**0.5
+            self.ball_vx = angle
+            self.ball_vy = speed * offset * 0.75
+            if self.ball_vx > 0:
+                self.ball_vx *= -1
 
-            const targetScore = {target_score};
-            const aiSpeed = {ai_speed};
+        # Scoring after movement
+        if self.ball_x < 0:
+            self.ai_score += 1
+            self._check_win_condition()
+            if not self.game_over:
+                self._reset_ball(direction=1)
+        elif self.ball_x > self.width:
+            self.player_score += 1
+            self._check_win_condition()
+            if not self.game_over:
+                self._reset_ball(direction=-1)
 
-            let playerScore = 0;
-            let aiScore = 0;
-            let gameIsOver = false;
+        return self.get_state()
 
-            const paddleWidth = 12;
-            const paddleHeight = 80;
+    def _reset_ball(self, direction: int):
+        self.ball_x = self.width / 2
+        self.ball_y = self.height / 2
+        angle = random.uniform(-0.4, 0.4)
+        speed = 5.0
+        self.ball_vx = speed * direction
+        self.ball_vy = speed * angle
 
-            let player = {{
-                x: 15,
-                y: canvas.height / 2 - paddleHeight / 2,
-                width: paddleWidth,
-                height: paddleHeight,
-                dy: 0
-            }};
+    def _check_win_condition(self):
+        winning_score = 5
+        if self.player_score >= winning_score:
+            self.game_over = True
+            self.winner = "Player"
+        elif self.ai_score >= winning_score:
+            self.game_over = True
+            self.winner = "AI"
 
-            let ai = {{
-                x: canvas.width - 27,
-                y: canvas.height / 2 - paddleHeight / 2,
-                width: paddleWidth,
-                height: paddleHeight
-            }};
+    def get_state(self) -> Dict[str, Any]:
+        return {
+            "ball_x": self.ball_x,
+            "ball_y": self.ball_y,
+            "player_y": self.player_y,
+            "ai_y": self.ai_y,
+            "player_score": self.player_score,
+            "ai_score": self.ai_score,
+            "game_over": self.game_over,
+            "winner": self.winner,
+            "width": self.width,
+            "height": self.height
+        }
 
-            let ball = {{
-                x: canvas.width / 2,
-                y: canvas.height / 2,
-                radius: 8,
-                speed: 5,
-                velocityX: 5,
-                velocityY: 3
-            }};
+# --- STREAMLIT UI ---
 
-            // Keyboard controls
-            let keys = {{}};
-            window.addEventListener('keydown', (e) => {{
-                keys[e.key] = true;
-                if(['ArrowUp', 'ArrowDown', ' '].includes(e.key)) e.preventDefault();
-            }});
-            window.addEventListener('keyup', (e) => {{
-                keys[e.key] = false;
-            }});
-
-            function moveUp() {{
-                player.y = Math.max(0, player.y - 35);
-            }}
-            function moveDown() {{
-                player.y = Math.min(canvas.height - player.height, player.y + 35);
-            }}
-
-            function collision(b, p) {{
-                return b.x - b.radius < p.x + p.width &&
-                       b.x + b.radius > p.x &&
-                       b.y + b.radius > p.y &&
-                       b.y - b.radius < p.y + p.height;
-            }}
-
-            function resetBall(scorer) {{
-                ball.x = canvas.width / 2;
-                ball.y = canvas.height / 2;
-                ball.speed = 5;
-                ball.velocityX = (scorer === 'player') ? -5 : 5;
-                ball.velocityY = (Math.random() * 4) - 2;
-            }}
-
-            function update() {{
-                if (gameIsOver) return;
-
-                // Player keyboard movement
-                if (keys['ArrowUp'] || keys['w'] || keys['W']) {{
-                    player.y = Math.max(0, player.y - 7);
-                }}
-                if (keys['ArrowDown'] || keys['s'] || keys['S']) {{
-                    player.y = Math.min(canvas.height - player.height, player.y + 7);
-                }}
-
-                // AI tracking logic with smooth interpolation
-                let targetY = ball.y - ai.height / 2;
-                ai.y += (targetY - ai.y) * ai_speed;
-                ai.y = Math.max(0, Math.min(canvas.height - ai.height, ai.y));
-
-                // Move ball
-                ball.x += ball.velocityX;
-                ball.y += ball.velocityY;
-
-                // Wall collisions (Top/Bottom)
-                if (ball.y - ball.radius < 0) {{
-                    ball.y = ball.radius;
-                    ball.velocityY *= -1;
-                }} else if (ball.y + ball.radius > canvas.height) {{
-                    ball.y = canvas.height - ball.radius;
-                    ball.velocityY *= -1;
-                }}
-
-                // Paddle collisions
-                let activePaddle = (ball.x < canvas.width / 2) ? player : ai;
-                if (collision(ball, activePaddle)) {{
-                    let collidePoint = ball.y - (activePaddle.y + activePaddle.height / 2);
-                    collidePoint = collidePoint / (activePaddle.height / 2);
-                    
-                    let angleRad = (Math.PI / 4) * collidePoint;
-                    let direction = (ball.x < canvas.width / 2) ? 1 : -1;
-                    
-                    ball.velocityX = direction * ball.speed * Math.cos(angleRad);
-                    ball.velocityY = ball.speed * Math.sin(angleRad);
-                    
-                    ball.speed += 0.3; // Incremental rally speed
-                }}
-
-                // Scoring
-                if (ball.x - ball.radius < 0) {{
-                    aiScore++;
-                    document.getElementById('aiScore').innerText = aiScore;
-                    checkGameOver();
-                    if (!gameIsOver) resetBall('ai');
-                }} else if (ball.x + ball.radius > canvas.width) {{
-                    playerScore++;
-                    document.getElementById('playerScore').innerText = playerScore;
-                    checkGameOver();
-                    if (!gameIsOver) resetBall('player');
-                }}
-            }}
-
-            function checkGameOver() {{
-                if (playerScore >= targetScore || aiScore >= targetScore) {{
-                    gameIsOver = true;
-                    const title = document.getElementById('modal-title');
-                    const desc = document.getElementById('modal-desc');
-                    
-                    if (playerScore > aiScore) {{
-                        title.innerText = "🎉 You Won the Match!";
-                        title.style.color = "#34d399";
-                    }} else {{
-                        title.innerText = "🤖 AI Wins the Match!";
-                        title.style.color = "#f87171";
-                    }}
-                    desc.innerText = `Final Score — {playerName}: ${{playerScore}} | AI: ${{aiScore}}`;
-                    document.getElementById('game-over-modal').style.display = 'flex';
-                    
-                    // Notify Streamlit parent component about match completion
-                    window.parent.postMessage({{
-                        type: 'streamlit:setComponentValue',
-                        value: {{ player_score: playerScore, ai_score: aiScore, completed: true }}
-                    }}, '*');
-                }}
-            }}
-
-            function restartGame() {{
-                playerScore = 0;
-                aiScore = 0;
-                document.getElementById('playerScore').innerText = '0';
-                document.getElementById('aiScore').innerText = '0';
-                document.getElementById('game-over-modal').style.display = 'none';
-                gameIsOver = false;
-                resetBall('player');
-            }}
-
-            function draw() {{
-                // Clear canvas
-                ctx.fillStyle = '#1e293b';
-                ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-                // Draw center net
-                ctx.strokeStyle = '#334155';
-                ctx.lineWidth = 4;
-                ctx.setLineDash([8, 8]);
-                ctx.beginPath();
-                ctx.moveTo(canvas.width / 2, 0);
-                ctx.lineTo(canvas.width / 2, canvas.height);
-                ctx.stroke();
-                ctx.setLineDash([]);
-
-                // Draw Player Paddle (Cyan)
-                ctx.fillStyle = '#38bdf8';
-                ctx.shadowColor = '#38bdf8';
-                ctx.shadowBlur = 10;
-                ctx.fillRect(player.x, player.y, player.width, player.height);
-
-                // Draw AI Paddle (Pink/Red)
-                ctx.fillStyle = '#f43f5e';
-                ctx.shadowColor = '#f43f5e';
-                ctx.shadowBlur = 10;
-                ctx.fillRect(ai.x, ai.y, ai.width, ai.height);
-
-                // Draw Ball (White)
-                ctx.fillStyle = '#ffffff';
-                ctx.shadowColor = '#ffffff';
-                ctx.shadowBlur = 12;
-                ctx.beginPath();
-                ctx.arc(ball.x, ball.y, ball.radius, 0, Math.PI * 2, false);
-                ctx.closePath();
-                ctx.fill();
-                ctx.shadowBlur = 0;
-            }}
-
-            function gameLoop() {{
-                update();
-                draw();
-                requestAnimationFrame(gameLoop);
-            }}
-
-            resetBall('player');
-            gameLoop();
-        </script>
-    </body>
-    </html>
-    """
-    
-    return components.html(html_code, height=480, scrolling=False)
-
-# ==========================================
-# STREAMLIT USER INTERFACE
-# ==========================================
+st.set_page_config(page_title="Retro Ping Pong AI", page_icon="🏓", layout="centered")
 
 def main():
-    st.set_page_config(
-        page_title="Retro Ping Pong Arena",
-        page_icon="🏓",
-        layout="centered"
-    )
-    
-    _init_db()
-    
-    # Custom Styling
-    st.markdown(
-        """
-        <style>
-            .main-title {
-                font-size: 2.8rem;
-                font-weight: 800;
-                background: linear-gradient(90deg, #38bdf8, #818cf8, #f43f5e);
-                -webkit-background-clip: text;
-                -webkit-text-fill-color: transparent;
-                text-align: center;
-                margin-bottom: 0px;
-            }
-            .subtitle {
-                text-align: center;
-                color: #94a3b8;
-                font-size: 1.1rem;
-                margin-bottom: 25px;
-            }
-            .stMetric {
-                background: #1e293b;
-                padding: 15px;
-                border-radius: 10px;
-                border: 1px solid #334155;
-            }
-        </style>
-        <h1 class="main-title">🏓 RETRO PING PONG ARENA</h1>
-        <p class="subtitle">Play live against the AI in real time. Use W/S or Arrow Keys (or mobile buttons).</p>
-        """,
-        unsafe_allow_html=True
-    )
-    
-    # Sidebar Configuration
+    st.markdown("<h1 style='text-align: center; color: #ff4b4b;'>🏓 RETRO PING PONG: PLAYER vs AI</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center; color: #a1a1a1;'>Use the On-Screen buttons or Keyboard (W/S or Up/Down arrows) to defeat the AI!</p>", unsafe_allow_html=True)
+
+    # Initialize session state for game engine
+    if "game" not in st.session_state:
+        st.session_state.game = GameEngine()
+    if "difficulty" not in st.session_state:
+        st.session_state.difficulty = 0.5
+    if "auto_play" not in st.session_state:
+        st.session_state.auto_play = False
+
+    game = st.session_state.game
+
+    # Sidebar controls
     with st.sidebar:
         st.header("⚙️ Game Settings")
-        player_name = st.text_input("Player Name", value="Champion", max_chars=15)
-        difficulty = st.selectbox("AI Difficulty", ["Easy", "Medium", "Hard", "Expert"], index=1)
-        target_score = st.slider("Target Score to Win", min_value=3, max_value=21, value=5)
+        st.session_state.difficulty = st.slider("🤖 AI Difficulty", 0.1, 1.0, 0.5, 0.1,
+                                                 help="Higher difficulty makes the AI faster and more precise.")
         
+        if st.button("🔄 Reset Match", use_container_width=True):
+            game.reset()
+            st.rerun()
+
         st.markdown("---")
-        st.subheader("🛠️ Database Controls")
-        if st.button("🗑️ Reset All Game Data", type="secondary", use_container_width=True):
-            if PingPongEngine.reset_database():
-                st.success("Database cleared successfully!")
-                st.rerun()
-            else:
-                st.error("Failed to reset database.")
+        st.markdown("### 📊 Match Statistics")
+        state = game.get_state()
+        st.metric(label="Your Score", value=state["player_score"])
+        st.metric(label="AI Score", value=state["ai_score"])
+        if state["game_over"]:
+            st.success(f"🏆 Winner: {state['winner']}!")
 
-    # Session state for tracking last completed match submission
-    if "last_submitted" not in st.session_state:
-        st.session_state.last_submitted = None
-
-    # Game Area
-    col1, col2, col3 = st.columns([1, 6, 1])
+    # Handle user action triggers via buttons
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col1:
+        if st.button("⬆️ UP", use_container_width=True):
+            game.update("UP", st.session_state.difficulty)
+            st.rerun()
     with col2:
-        render_game_canvas(difficulty, target_score, player_name)
+        if st.button("⏸️ PAUSE / STEP", use_container_width=True):
+            game.update("NONE", st.session_state.difficulty)
+            st.rerun()
+    with col3:
+        if st.button("⬇️ DOWN", use_container_width=True):
+            game.update("DOWN", st.session_state.difficulty)
+            st.rerun()
 
-    st.markdown("---")
-    
-    # Leaderboard & Match History
-    st.subheader("🏆 Leaderboard & Match History")
-    leaderboard_data = PingPongEngine.get_leaderboard()
-    
-    if leaderboard_data:
-        st.dataframe(
-            leaderboard_data,
-            column_config={
-                "id": "ID",
-                "player_name": "Player",
-                "player_score": "Player Score",
-                "ai_score": "AI Score",
-                "difficulty": "Difficulty",
-                "timestamp": "Match Time"
-            },
-            use_container_width=True,
-            hide_index=True
-        )
-    else:
-        st.info("No matches recorded yet. Play a match to populate the leaderboard!")
+    # Render HTML Canvas and keyboard event listener
+    current_state = game.get_state()
+    state_json = json.dumps(current_state)
 
-    # Quick save helper form if user wants to log score manually or test backend
-    with st.expander("📝 Manual Score Log (Testing & Backup)"):
-        with st.form("manual_score_form"):
-            m_col1, m_col2, m_col3 = st.columns(3)
-            with m_col1:
-                p_score = st.number_input("Player Score", min_value=0, max_value=21, value=3)
-            with m_col2:
-                a_score = st.number_input("AI Score", min_value=0, max_value=21, value=5)
-            with m_col3:
-                m_diff = st.selectbox("Difficulty Level", ["Easy", "Medium", "Hard", "Expert"], index=1)
-            
-            submit_btn = st.form_submit_button("Save Match to Database")
-            if submit_btn:
-                success = PingPongEngine.save_match(player_name, p_score, a_score, m_diff)
-                if success:
-                    st.success("Match successfully recorded!")
-                    st.rerun()
-                else:
-                    st.error("Error saving match.")
+    canvas_html = f"""
+    <div style="display: flex; justify-content: center; background-color: #0e1117; padding: 10px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.5);">
+        <canvas id="pingPongCanvas" width="{current_state['width']}" height="{current_state['height']}" style="background: #1a1c23; border-radius: 8px;"></canvas>
+    </div>
+    <script>
+        const canvas = document.getElementById('pingPongCanvas');
+        const ctx = canvas.getContext('2d');
+        let gameState = {state_json};
+
+        function draw() {{
+            ctx.fillStyle = '#1a1c23';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            ctx.strokeStyle = '#3a3f4b';
+            ctx.lineWidth = 4;
+            ctx.setLineDash([10, 10]);
+            ctx.beginPath();
+            ctx.moveTo(canvas.width / 2, 0);
+            ctx.lineTo(canvas.width / 2, canvas.height);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            ctx.fillStyle = '#00f0ff';
+            ctx.shadowBlur = 15;
+            ctx.shadowColor = '#00f0ff';
+            ctx.fillRect(20, gameState.player_y, 15, 100);
+
+            ctx.fillStyle = '#ff007f';
+            ctx.shadowColor = '#ff007f';
+            ctx.fillRect(canvas.width - 35, gameState.ai_y, 15, 100);
+
+            ctx.fillStyle = '#ffcc00';
+            ctx.shadowColor = '#ffcc00';
+            ctx.beginPath();
+            ctx.arc(gameState.ball_x, gameState.ball_y, 10, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.shadowBlur = 0;
+
+            ctx.font = 'bold 48px monospace';
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
+            ctx.textAlign = 'center';
+            ctx.fillText(gameState.player_score, canvas.width / 4, 70);
+            ctx.fillText(gameState.ai_score, (canvas.width / 4) * 3, 70);
+
+            if (gameState.game_over) {{
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.75)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.font = 'bold 36px sans-serif';
+                ctx.fillStyle = '#00ffcc';
+                ctx.fillText("GAME OVER - WINNER: " + gameState.winner, canvas.width / 2, canvas.height / 2);
+            }}
+        }}
+        draw();
+    </script>
+    """
+
+    st.markdown(canvas_html, unsafe_allow_html=True)
+
+    if not current_state["game_over"]:
+        import time
+        time.sleep(0.03)
+        game.update("NONE", st.session_state.difficulty)
+        st.rerun()
 
 if __name__ == "__main__":
     main()
