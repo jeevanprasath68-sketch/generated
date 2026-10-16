@@ -358,7 +358,7 @@ def main():
                 if (player.score >= targetScore || ai.score >= targetScore) {{
                     gameRunning = false;
                     let winnerName = player.score >= targetScore ? "PLAYER WINS! 🏆" : "AI WINS! 🤖";
-                    statusText.innerHTML = `Game Over! ${winnerName} Final Score: ${player.score} - ${ai.score}`;
+                    statusText.innerHTML = "Game Over! " + winnerName + " Final Score: " + player.score + " - " + ai.score;
                     
                     // Send score back to Streamlit via URL fetch or event simulation if required
                     // For simplicity, we trigger visual notification
