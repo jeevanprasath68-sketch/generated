@@ -1,68 +1,74 @@
 import pytest
-import sqlite3
 import os
-from app import GameEngine, DB_NAME, _init_db
+import sqlite3
+from app import ArcadeDB, GameConfig, DB_FILE
 
 @pytest.fixture(autouse=True)
-def setup_and_teardown():
-    # Setup clean test database before each test
-    if os.path.exists(DB_NAME):
-        os.remove(DB_NAME)
-    _init_db()
+def setup_db():
+    # Setup fresh DB for testing
+    if os.path.exists(DB_FILE):
+        os.remove(DB_FILE)
+    ArcadeDB.init_db()
     yield
-    # Teardown after test
-    if os.path.exists(DB_NAME):
-        os.remove(DB_NAME)
+    if os.path.exists(DB_FILE):
+        os.remove(DB_FILE)
 
-def test_init_db_creates_table():
-    """Test that database and match_history table are correctly initialized."""
-    conn = sqlite3.connect(DB_NAME)
+def test_database_initialization():
+    """Test that database and tables are correctly initialized."""
+    conn = ArcadeDB.get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='match_history';")
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='high_scores'")
     table = cursor.fetchone()
     conn.close()
     assert table is not None
-    assert table[0] == 'match_history'
 
-def test_record_match_player_wins():
-    """Test recording a match where the player wins."""
-    result = GameEngine.record_match(player_score=5, ai_score=3, difficulty="Medium")
-    assert result["winner"] == "Player"
-    assert result["player_score"] == 5
-    assert result["ai_score"] == 3
+def test_add_and_get_score():
+    """Test adding a score and retrieving the leaderboard."""
+    ArcadeDB.add_score("TestPlayer", 7, 3, "Normal")
+    leaderboard = ArcadeDB.get_leaderboard(limit=5)
     
-    history = GameEngine.get_leaderboard()
-    assert len(history) == 1
-    assert history[0]["winner"] == "Player"
-    assert history[0]["difficulty"] == "Medium"
+    assert len(leaderboard) == 1
+    assert leaderboard[0]["player_name"] == "TestPlayer"
+    assert leaderboard[0]["score"] == 7
+    assert leaderboard[0]["ai_score"] == 3
+    assert leaderboard[0]["difficulty"] == "Normal"
 
-def test_record_match_ai_wins():
-    """Test recording a match where the AI wins."""
-    result = GameEngine.record_match(player_score=1, ai_score=5, difficulty="Hard")
-    assert result["winner"] == "AI"
-    
-    history = GameEngine.get_leaderboard()
-    assert len(history) == 1
-    assert history[0]["winner"] == "AI"
+def test_global_stats_increment():
+    """Test global match and points statistics tracking."""
+    stats_before = ArcadeDB.get_global_stats()
+    assert stats_before["total_matches"] == 0
+    assert stats_before["total_points_scored"] == 0
 
-def test_calculate_ai_speed_valid():
-    """Test AI speed calculation returns correct values for valid difficulties."""
-    assert GameEngine.calculate_ai_speed("Easy") == 0.05
-    assert GameEngine.calculate_ai_speed("Medium") == 0.08
-    assert GameEngine.calculate_ai_speed("Hard") == 0.12
-    assert GameEngine.calculate_ai_speed("Insane") == 0.18
+    ArcadeDB.add_score(
+        player_name="Champ",
+        score=10,
+        ai_score=8,
+        difficulty="Hard"
+    )
 
-def test_calculate_ai_speed_invalid():
-    """Test that invalid difficulty raises ValueError."""
-    with pytest.raises(ValueError):
-        GameEngine.calculate_ai_speed("Impossible")
+    stats_after = ArcadeDB.get_global_stats()
+    assert stats_after["total_matches"] == 1
+    assert stats_after["total_points_scored"] == 18
 
 def test_clear_database():
-    """Test clearing database wipes all match records."""
-    GameEngine.record_match(player_score=5, ai_score=0, difficulty="Easy")
-    GameEngine.record_match(player_score=4, ai_score=5, difficulty="Insane")
+    """Test clearing the database wipes scores and resets stats."""
+    ArcadeDB.add_score("RetroKing", 5, 1, "Easy")
+    assert len(ArcadeDB.get_leaderboard()) == 1
+
+    ArcadeDB.clear_database()
+    assert len(ArcadeDB.get_leaderboard()) == 0
+    stats = ArcadeDB.get_global_stats()
+    assert stats["total_matches"] == 0
+
+def test_game_config_difficulties():
+    """Test that all game configuration levels are well-defined."""
+    assert "Easy" in GameConfig.DIFFICULTIES
+    assert "Normal" in GameConfig.DIFFICULTIES
+    assert "Hard" in GameConfig.DIFFICULTIES
+    assert "Extreme" in GameConfig.DIFFICULTIES
     
-    assert len(GameEngine.get_leaderboard()) == 2
-    
-    GameEngine.clear_database()
-    assert len(GameEngine.get_leaderboard()) == 0
+    for diff, cfg in GameConfig.DIFFICULTIES.items():
+        assert "ai_speed" in cfg
+        assert "ball_speed" in cfg
+        assert "target_score" in cfg
+        assert cfg["target_score"] > 0
