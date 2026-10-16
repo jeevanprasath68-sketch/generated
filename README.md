@@ -1,6 +1,6 @@
 # Generated Application
 
-**Requirement:** Build a functional web application called CampusFind — College Lost & Found Portal using Python and Streamlit with search, category filtering, persistent database, and claim reporting.
+**Requirement:** Build a comprehensive personal finance dashboard with income/expense logging, category breakdown charts, monthly budget tracker, and CSV export.
 
 **Format:** Streamlit Web App
 

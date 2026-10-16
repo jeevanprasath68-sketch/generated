@@ -1,343 +1,416 @@
-import streamlit as st
 import sqlite3
-from datetime import datetime
 import pandas as pd
-import os
-from typing import List, Dict, Any, Optional
+import numpy as np
+import datetime
+import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
+from typing import List, Dict, Any, Tuple, Optional
 
-DB_FILE = "campus_find.db"
+DB_FILE = "finance_dashboard.db"
 
-class DatabaseEngine:
+# ==========================================
+# BUSINESS LOGIC & DATA ENGINE
+# ==========================================
+
+class FinanceEngine:
     def __init__(self, db_path: str = DB_FILE):
         self.db_path = db_path
-        self.init_db()
+        self._init_db()
 
-    def get_connection(self) -> sqlite3.Connection:
+    def _get_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
 
-    def init_db(self):
-        conn = self.get_connection()
+    def _init_db(self) -> None:
+        """Initializes the database and performs self-healing schema migration for robustness."""
+        conn = self._get_connection()
         cursor = conn.cursor()
         
-        # Create table if not exists
+        # Create transactions table
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS items (
+            CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
+                date TEXT NOT NULL,
+                type TEXT NOT NULL,
                 category TEXT NOT NULL,
-                status TEXT NOT NULL,
-                location TEXT NOT NULL,
-                date_lost_found TEXT NOT NULL,
-                description TEXT,
-                contact_info TEXT NOT NULL,
-                claim_status TEXT DEFAULT 'Unclaimed',
-                claim_details TEXT,
-                created_at TEXT NOT NULL
+                amount REAL NOT NULL,
+                description TEXT
             )
         ''')
-        conn.commit()
         
-        # Defensive schema migration: ensure all expected columns exist
-        expected_columns = {
-            "title": "TEXT NOT NULL DEFAULT ''",
-            "category": "TEXT NOT NULL DEFAULT 'Other'",
-            "status": "TEXT NOT NULL DEFAULT 'Lost'",
-            "location": "TEXT NOT NULL DEFAULT ''",
-            "date_lost_found": "TEXT NOT NULL DEFAULT ''",
-            "description": "TEXT DEFAULT ''",
-            "contact_info": "TEXT NOT NULL DEFAULT ''",
-            "claim_status": "TEXT DEFAULT 'Unclaimed'",
-            "claim_details": "TEXT DEFAULT ''",
-            "created_at": "TEXT NOT NULL DEFAULT ''"
+        # Create budgets table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS budgets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL UNIQUE,
+                monthly_limit REAL NOT NULL
+            )
+        ''')
+        
+        # Defensive schema migration: check columns for transactions
+        cursor.execute("PRAGMA table_info(transactions)")
+        existing_cols = {row["name"] for row in cursor.fetchall()}
+        required_trans_cols = {
+            "date": "TEXT",
+            "type": "TEXT",
+            "category": "TEXT",
+            "amount": "REAL",
+            "description": "TEXT"
         }
-        
-        cursor.execute("PRAGMA table_info(items)")
-        existing_cols = {row[1] for row in cursor.fetchall()}
-        
-        for col_name, col_def in expected_columns.items():
-            if col_name not in existing_cols:
-                cursor.execute(f"ALTER TABLE items ADD COLUMN {col_name} {col_def}")
-        
+        for col, col_type in required_trans_cols.items():
+            if col not in existing_cols:
+                try:
+                    cursor.execute(f"ALTER TABLE transactions ADD COLUMN {col} {col_type}")
+                except Exception:
+                    pass
+
+        # Defensive schema migration: check columns for budgets
+        cursor.execute("PRAGMA table_info(budgets)")
+        existing_budget_cols = {row["name"] for row in cursor.fetchall()}
+        required_budget_cols = {
+            "category": "TEXT",
+            "monthly_limit": "REAL"
+        }
+        for col, col_type in required_budget_cols.items():
+            if col not in existing_budget_cols:
+                try:
+                    cursor.execute(f"ALTER TABLE budgets ADD COLUMN {col} {col_type}")
+                except Exception:
+                    pass
+
         conn.commit()
         conn.close()
 
-    def add_item(self, data: Dict[str, Any]) -> int:
-        conn = self.get_connection()
+    def reset_database(self) -> None:
+        """Wipes all tables and re-initializes schema."""
+        conn = self._get_connection()
         cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO items (title, category, status, location, date_lost_found, description, contact_info, claim_status, claim_details, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            data.get("title"),
-            data.get("category"),
-            data.get("status"),
-            data.get("location"),
-            data.get("date_lost_found"),
-            data.get("description", ""),
-            data.get("contact_info"),
-            data.get("claim_status", "Unclaimed"),
-            data.get("claim_details", ""),
-            datetime.now().isoformat()
-        ))
+        cursor.execute("DROP TABLE IF EXISTS transactions")
+        cursor.execute("DROP TABLE IF EXISTS budgets")
         conn.commit()
-        item_id = cursor.lastrowid
         conn.close()
-        return item_id
+        self._init_db()
 
-    def get_items(self, search: str = "", category: str = "All", status: str = "All", claim_status: str = "All") -> List[Dict[str, Any]]:
+    def add_transaction(self, date: str, trans_type: str, category: str, amount: float, description: str = "") -> int:
+        if amount <= 0:
+            raise ValueError("Transaction amount must be greater than zero.")
+        if trans_type not in ["Income", "Expense"]:
+            raise ValueError("Transaction type must be 'Income' or 'Expense'.")
+            
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO transactions (date, type, category, amount, description) VALUES (?, ?, ?, ?, ?)",
+            (date, trans_type, category, amount, description)
+        )
+        conn.commit()
+        last_id = cursor.lastrowid
+        conn.close()
+        return last_id
+
+    def delete_transaction(self, trans_id: int) -> None:
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM transactions WHERE id = ?", (trans_id,))
+        conn.commit()
+        conn.close()
+
+    def get_transactions(self) -> pd.DataFrame:
         try:
-            conn = self.get_connection()
-            cursor = conn.cursor()
-            query = "SELECT * FROM items WHERE 1=1"
-            params = []
-
-            if search:
-                query += " AND (title LIKE ? OR description LIKE ? OR location LIKE ?)"
-                like_term = f"%{search}%"
-                params.extend([like_term, like_term, like_term])
-
-            if category and category != "All":
-                query += " AND category = ?"
-                params.append(category)
-
-            if status and status != "All":
-                query += " AND status = ?"
-                params.append(status)
-
-            if claim_status and claim_status != "All":
-                query += " AND claim_status = ?"
-                params.append(claim_status)
-
-            query += " ORDER BY id DESC"
-            cursor.execute(query, params)
-            rows = cursor.fetchall()
+            conn = self._get_connection()
+            df = pd.read_sql_query("SELECT * FROM transactions ORDER BY date DESC, id DESC", conn)
             conn.close()
-            return [dict(row) for row in rows]
+            if not df.empty:
+                df['date'] = pd.to_datetime(df['date']).dt.date
+            return df
         except sqlite3.OperationalError:
-            self.init_db()
-            return self.get_items(search, category, status, claim_status)
+            self._init_db()
+            return pd.DataFrame(columns=["id", "date", "type", "category", "amount", "description"])
 
-    def update_claim(self, item_id: int, claim_status: str, claim_details: str) -> bool:
-        conn = self.get_connection()
+    def set_budget(self, category: str, monthly_limit: float) -> None:
+        if monthly_limit < 0:
+            raise ValueError("Budget limit cannot be negative.")
+        conn = self._get_connection()
         cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE items SET claim_status = ?, claim_details = ? WHERE id = ?
-        ''', (claim_status, claim_details, item_id))
+        cursor.execute(
+            "INSERT INTO budgets (category, monthly_limit) VALUES (?, ?) ON CONFLICT(category) DO UPDATE SET monthly_limit = ?",
+            (category, monthly_limit, monthly_limit)
+        )
         conn.commit()
-        updated = cursor.rowcount > 0
         conn.close()
-        return updated
 
-    def delete_item(self, item_id: int) -> bool:
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM items WHERE id = ?", (item_id,))
-        conn.commit()
-        deleted = cursor.rowcount > 0
-        conn.close()
-        return deleted
+    def get_budgets(self) -> pd.DataFrame:
+        try:
+            conn = self._get_connection()
+            df = pd.read_sql_query("SELECT * FROM budgets", conn)
+            conn.close()
+            return df
+        except sqlite3.OperationalError:
+            self._init_db()
+            return pd.DataFrame(columns=["id", "category", "monthly_limit"])
 
-    def reset_database(self):
-        if os.path.exists(self.db_path):
-            os.remove(self.db_path)
-        self.init_db()
+    def calculate_summary(self, df: pd.DataFrame) -> Dict[str, float]:
+        if df.empty:
+            return {"total_income": 0.0, "total_expense": 0.0, "net_savings": 0.0, "savings_rate": 0.0}
+        
+        income_df = df[df['type'] == 'Income']
+        expense_df = df[df['type'] == 'Expense']
+        
+        total_income = float(income_df['amount'].sum()) if not income_df.empty else 0.0
+        total_expense = float(expense_df['amount'].sum()) if not expense_df.empty else 0.0
+        net_savings = total_income - total_expense
+        savings_rate = (net_savings / total_income * 100) if total_income > 0 else 0.0
+        
+        return {
+            "total_income": total_income,
+            "total_expense": total_expense,
+            "net_savings": net_savings,
+            "savings_rate": savings_rate
+        }
 
-
-class ItemValidator:
-    @staticmethod
-    def validate_item_submission(data: Dict[str, Any]) -> List[str]:
-        errors = []
-        if not data.get("title", "").strip():
-            errors.append("Title is required.")
-        if not data.get("category", "").strip():
-            errors.append("Category is required.")
-        if not data.get("location", "").strip():
-            errors.append("Location is required.")
-        if not data.get("contact_info", "").strip():
-            errors.append("Contact Information is required.")
-        return errors
-
+# ==========================================
+# STREAMLIT USER INTERFACE
+# ==========================================
 
 def main():
     st.set_page_config(
-        page_title="CampusFind — College Lost & Found Portal",
-        page_icon="🎒",
+        page_title="Personal Finance Dashboard",
+        page_icon="💰",
         layout="wide"
     )
 
-    db = DatabaseEngine()
+    engine = FinanceEngine(DB_FILE)
 
-    # Sidebar Navigation and DB Management
-    st.sidebar.title("🎒 CampusFind")
-    st.sidebar.markdown("Find what you lost, return what you found.")
-    
-    page = st.sidebar.radio("Navigation", ["Browse Portal", "Report Lost/Found Item", "Manage Claims & Items"])
+    # --- SIDEBAR & CONTROLS ---
+    st.sidebar.title("⚙️ Controls & Navigation")
+    page = st.sidebar.radio("Select View", ["Dashboard & Analytics", "Log Transaction", "Manage Budgets", "Data Management"])
 
     st.sidebar.markdown("---")
-    with st.sidebar.expander("⚙️ Database Settings"):
-        if st.button("Reset Database / Wipe All", type="primary"):
-            db.reset_database()
-            st.success("Database successfully reset!")
-            st.rerun()
+    st.sidebar.subheader("🛠️ Database Maintenance")
+    if st.sidebar.button("⚠️ Reset All Data", type="secondary", help="Wipes all transactions and budgets."):
+        engine.reset_database()
+        st.sidebar.success("Database reset successfully!")
+        st.rerun()
 
-    categories = ["All", "Electronics", "ID / Cards", "Keys", "Clothing", "Books & Notes", "Bags / Wallets", "Other"]
-    statuses = ["All", "Lost", "Found"]
-    claim_statuses = ["All", "Unclaimed", "Claim Pending", "Resolved"]
+    # --- FETCH DATA ---
+    df_trans = engine.get_transactions()
+    df_budgets = engine.get_budgets()
 
-    if page == "Browse Portal":
-        st.title("🔍 Campus Lost & Found Portal")
-        st.markdown("Search through items reported lost or found across campus.")
+    # ==========================================
+    # PAGE 1: DASHBOARD & ANALYTICS
+    # ==========================================
+    if page == "Dashboard & Analytics":
+        st.title("📊 Personal Finance Dashboard")
+        st.markdown("Get a high-level view of your income, expenses, savings rate, and category breakdowns.")
 
-        # Metrics row
-        all_items = db.get_items()
-        total_items = len(all_items)
-        lost_count = sum(1 for i in all_items if i['status'] == 'Lost')
-        found_count = sum(1 for i in all_items if i['status'] == 'Found')
-        resolved_count = sum(1 for i in all_items if i['claim_status'] == 'Resolved')
+        # Global Date & Type Filters in expander or top bar
+        if not df_trans.empty:
+            st.sidebar.markdown("### 🔍 Filters")
+            min_date = min(df_trans['date'])
+            max_date = max(df_trans['date'])
+            
+            date_range = st.sidebar.date_input(
+                "Filter by Date Range",
+                value=(min_date, max_date),
+                min_value=min_date,
+                max_value=max_date
+            )
+            
+            if isinstance(date_range, tuple) and len(date_range) == 2:
+                start_d, end_d = date_range
+                mask = (df_trans['date'] >= start_d) & (df_trans['date'] <= end_d)
+                filtered_df = df_trans.loc[mask]
+            else:
+                filtered_df = df_trans
+        else:
+            filtered_df = df_trans
 
+        # Calculate Metrics
+        summary = engine.calculate_summary(filtered_df)
+
+        # KPI Metrics Row
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total Items", total_items)
-        col2.metric("Lost Items", lost_count)
-        col3.metric("Found Items", found_count)
-        col4.metric("Resolved Claims", resolved_count)
+        with col1:
+            st.metric(label="Total Income", value=f"${summary['total_income']:,.2f}", delta=None)
+        with col2:
+            st.metric(label="Total Expenses", value=f"${summary['total_expense']:,.2f}", delta=None, delta_color="inverse")
+        with col3:
+            st.metric(label="Net Savings", value=f"${summary['net_savings']:,.2f}", delta=f"{summary['savings_rate']:.1f}% rate")
+        with col4:
+            savings_status = "🟢 Healthy" if summary['savings_rate'] >= 20 else ("🟡 Moderate" if summary['savings_rate'] >= 0 else "🔴 Deficit")
+            st.metric(label="Savings Status", value=savings_status)
 
         st.markdown("---")
 
-        # Search and Filters
-        f_col1, f_col2, f_col3, f_col4 = st.columns(4)
-        with f_col1:
-            search_query = st.text_input("Search keyword", placeholder="e.g. iPhone, Keys...")
-        with f_col2:
-            sel_category = st.selectbox("Category", categories)
-        with f_col3:
-            sel_status = st.selectbox("Status", statuses)
-        with f_col4:
-            sel_claim = st.selectbox("Claim Status", claim_statuses)
-
-        filtered_items = db.get_items(search=search_query, category=sel_category, status=sel_status, claim_status=sel_claim)
-
-        st.markdown(f"### Results ({len(filtered_items)} items found)")
-
-        if not filtered_items:
-            st.info("No items match your search criteria.")
+        if filtered_df.empty:
+            st.info("No transaction records found. Add transactions using the 'Log Transaction' tab or sidebar!")
         else:
-            for item in filtered_items:
-                with st.container():
-                    badge_color = "orange" if item["status"] == "Lost" else "green"
-                    claim_color = "red" if item["claim_status"] == "Unclaimed" else ("blue" if item["claim_status"] == "Claim Pending" else "green")
-                    
-                    col_a, col_b = st.columns([3, 1])
-                    with col_a:
-                        st.markdown(f"#### {item['title']} :blue-badge[{item['category']}] :orange-badge[{item['status']}] :violet-badge[{item['claim_status']}]")
-                        st.write(f"📍 **Location:** {item['location']} | 📅 **Date:** {item['date_lost_found']}")
-                        if item["description"]:
-                            st.write(f"📝 {item['description']}")
-                    with col_b:
-                        st.markdown(f"**Contact:** `{item['contact_info']}`")
-                        if item["claim_status"] != "Resolved":
-                            if st.button(f"Claim / Inquire #{item['id']}", key=f"claim_btn_{item['id']}"):
-                                st.session_state[f"claiming_{item['id']}"] = True
-                        else:
-                            st.success("Resolved ✓")
+            # Charts Section
+            chart_col1, chart_col2 = st.columns(2)
 
-                    # Claim dialog expansion inline
-                    if st.session_state.get(f"claiming_{item['id']}", False):
-                        with st.form(key=f"claim_form_{item['id']}"):
-                            st.markdown(f"**Submit Claim Details for Item #{item['id']}: {item['title']}**")
-                            claimant_info = st.text_input("Your Name & Student ID / Email")
-                            proof_details = st.text_area("Provide identifying details / proof of ownership")
-                            sub_c1, sub_c2 = st.columns(2)
-                            submit_claim = sub_c1.form_submit_button("Submit Claim Request")
-                            cancel_claim = sub_c2.form_submit_button("Cancel")
-
-                            if submit_claim:
-                                if not claimant_info or not proof_details:
-                                    st.error("Please provide both your identity and proof details.")
-                                else:
-                                    full_claim_info = f"Claimant: {claimant_info} | Proof: {proof_details}"
-                                    db.update_claim(item["id"], "Claim Pending", full_claim_info)
-                                    st.success("Claim submitted successfully! The finder/admin will review it.")
-                                    st.session_state[f"claiming_{item['id']}"] = False
-                                    st.rerun()
-                            if cancel_claim:
-                                st.session_state[f"claiming_{item['id']}"] = False
-                                st.rerun()
-
-                    st.divider()
-
-    elif page == "Report Lost/Found Item":
-        st.title("📝 Report a Lost or Found Item")
-        st.markdown("Fill out the details below to list an item on CampusFind.")
-
-        with st.form("report_form"):
-            r_col1, r_col2 = st.columns(2)
-            with r_col1:
-                title = st.text_input("Item Title / Name*")
-                category = st.selectbox("Category", [c for c in categories if c != "All"])
-                status = st.selectbox("Status", ["Lost", "Found"])
-                date_lost_found = st.date_input("Date Lost / Found", datetime.now())
-            with r_col2:
-                location = st.text_input("Location (e.g. Library 2nd Floor, Student Union)*")
-                contact_info = st.text_input("Contact Info (Email / Phone)*")
-                description = st.text_area("Detailed Description (Color, Brand, Unique marks)")
-
-            submitted = st.form_submit_button("Publish Item")
-
-            if submitted:
-                item_data = {
-                    "title": title,
-                    "category": category,
-                    "status": status,
-                    "location": location,
-                    "date_lost_found": str(date_lost_found),
-                    "description": description,
-                    "contact_info": contact_info
-                }
-                errors = ItemValidator.validate_item_submission(item_data)
-                if errors:
-                    for err in errors:
-                        st.error(err)
+            with chart_col1:
+                st.subheader("📂 Expenses by Category")
+                exp_df = filtered_df[filtered_df['type'] == 'Expense']
+                if not exp_df.empty:
+                    cat_exp = exp_df.groupby('category')['amount'].sum().reset_index()
+                    fig_pie = px.pie(cat_exp, names='category', values='amount', hole=0.4, color_discrete_sequence=px.colors.sequential.RdBu)
+                    fig_pie.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=350)
+                    st.plotly_chart(fig_pie, use_container_width=True)
                 else:
-                    item_id = db.add_item(item_data)
-                    st.success(f"Item successfully reported with ID #{item_id}!")
+                    st.info("No expense records in this range.")
 
-    elif page == "Manage Claims & Items":
-        st.title("⚙️ Manage Claims & Status")
-        st.markdown("Review pending claims, update item status to resolved, or remove outdated entries.")
+            with chart_col2:
+                st.subheader("📈 Income vs. Expense Trend")
+                trend_df = filtered_df.copy()
+                trend_df['month'] = pd.to_datetime(trend_df['date']).dt.to_period('M').astype(str)
+                monthly_group = trend_df.groupby(['month', 'type'])['amount'].sum().reset_index()
+                if not monthly_group.empty:
+                    fig_bar = px.bar(monthly_group, x='month', y='amount', color='type', barmode='group',
+                                     color_discrete_map={'Income': '#2ecc71', 'Expense': '#e74c3c'})
+                    fig_bar.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=350)
+                    st.plotly_chart(fig_bar, use_container_width=True)
+                else:
+                    st.info("Insufficient data for trend analysis.")
 
-        items = db.get_items()
-        if not items:
-            st.info("No items in the database.")
+            # Monthly Budget Tracker Section
+            st.subheader("🎯 Monthly Budget Performance")
+            if not df_budgets.empty:
+                current_month_str = datetime.date.today().strftime('%Y-%m')
+                current_month_exp = filtered_df[
+                    (filtered_df['type'] == 'Expense') &
+                    (pd.to_datetime(filtered_df['date']).dt.strftime('%Y-%m') == current_month_str)
+                ]
+                actual_spend = current_month_exp.groupby('category')['amount'].sum().reset_index()
+                
+                budget_tracker = pd.merge(df_budgets, actual_spend, on='category', how='left').fillna(0)
+                budget_tracker.rename(columns={'amount': 'spent', 'monthly_limit': 'budget'}, inplace=True)
+                budget_tracker['remaining'] = budget_tracker['budget'] - budget_tracker['spent']
+                budget_tracker['percentage'] = (budget_tracker['spent'] / budget_tracker['budget'] * 100).fillna(0)
+
+                for _, row in budget_tracker.iterrows():
+                    cat = row['category']
+                    spent = row['spent']
+                    limit = row['budget']
+                    pct = min(row['percentage'], 100.0)
+                    
+                    col_b1, col_b2 = st.columns([3, 1])
+                    with col_b1:
+                        st.text(f"{cat}: ${spent:,.2f} spent of ${limit:,.2f} limit ({row['percentage']:.1f}%)")
+                        st.progress(int(pct))
+                    with col_b2:
+                        if spent > limit:
+                            st.error(f"Over by ${spent - limit:,.2f}")
+                        else:
+                            st.success(f"Left: ${limit - spent:,.2f}")
+            else:
+                st.info("No budgets configured yet. Set budgets in the 'Manage Budgets' tab.")
+
+            # Recent Transactions Table with Delete Option
+            st.markdown("---")
+            st.subheader("📋 Transaction History")
+            
+            # Display editable/deletable dataframe view
+            display_df = filtered_df.copy()
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    # ==========================================
+    # PAGE 2: LOG TRANSACTION
+    # ==========================================
+    elif page == "Log Transaction":
+        st.title("📝 Log Income or Expense")
+        st.markdown("Record your financial inflows and outflows quickly.")
+
+        default_categories = {
+            "Income": ["Salary", "Freelance", "Investments", "Gifts", "Other Income"],
+            "Expense": ["Housing", "Groceries", "Utilities", "Transportation", "Entertainment", "Healthcare", "Dining Out", "Shopping", "Other Expense"]
+        }
+
+        with st.form("transaction_form", clear_on_submit=True):
+            col1, col2 = st.columns(2)
+            with col1:
+                trans_type = st.selectbox("Transaction Type", ["Expense", "Income"])
+                amount = st.number_input("Amount ($", min_value=0.01, step=1.00, format="%.2f")
+            with col2:
+                date = st.date_input("Date", value=datetime.date.today())
+                categories = default_categories.get(trans_type, ["General"])
+                category = st.selectbox("Category", categories)
+            
+            description = st.text_input("Description / Note (Optional)", placeholder="e.g., Weekly grocery run at Whole Foods")
+            
+            submitted = st.form_submit_button("💾 Save Transaction", type="primary")
+            if submitted:
+                try:
+                    engine.add_transaction(str(date), trans_type, category, float(amount), description)
+                    st.success(f"Successfully logged {trans_type} of ${amount:.2f} under {category}!")
+                except ValueError as e:
+                    st.error(str(e))
+
+        st.markdown("---")
+        st.subheader("🗑️ Delete Recent Transactions")
+        if not df_trans.empty:
+            trans_to_delete = st.selectbox(
+                "Select Transaction to Delete",
+                options=df_trans['id'].tolist(),
+                format_func=lambda x: f"ID {x}: {df_trans.loc[df_trans['id'] == x, 'date'].values[0]} | {df_trans.loc[df_trans['id'] == x, 'type'].values[0]} | {df_trans.loc[df_trans['id'] == x, 'category'].values[0]} | ${df_trans.loc[df_trans['id'] == x, 'amount'].values[0]:,.2f}"
+            )
+            if st.button("Delete Selected Transaction"):
+                engine.delete_transaction(trans_to_delete)
+                st.success(f"Deleted transaction ID {trans_to_delete} successfully!")
+                st.rerun()
         else:
-            item_options = {f"#{item['id']} - {item['title']} ({item['status']}) [{item['claim_status']}]": item for item in items}
-            selected_label = st.selectbox("Select Item to Manage", list(item_options.keys()))
-            selected_item = item_options[selected_label]
+            st.info("No transactions available to delete.")
 
-            st.markdown(f"### Managing Item #{selected_item['id']}: {selected_item['title']}")
-            st.write(f"**Category:** {selected_item['category']} | **Status:** {selected_item['status']}")
-            st.write(f"**Location:** {selected_item['location']} | **Date:** {selected_item['date_lost_found']}")
-            st.write(f"**Contact:** {selected_item['contact_info']}")
-            st.write(f"**Description:** {selected_item['description']}")
-            st.info(f"**Current Claim Status:** {selected_item['claim_status']}\n\n**Claim Details:** {selected_item['claim_details'] or 'None'}")
+    # ==========================================
+    # PAGE 3: MANAGE BUDGETS
+    # ==========================================
+    elif page == "Manage Budgets":
+        st.title("🎯 Monthly Budget Manager")
+        st.markdown("Set spending limits for your expense categories to keep your finances on track.")
 
-            m_col1, m_col2 = st.columns(2)
-            with m_col1:
-                new_claim_status = st.selectbox("Update Claim Status", ["Unclaimed", "Claim Pending", "Resolved"], index=["Unclaimed", "Claim Pending", "Resolved"].index(selected_item['claim_status']) if selected_item['claim_status'] in ["Unclaimed", "Claim Pending", "Resolved"] else 0)
-                update_notes = st.text_input("Claim Resolution Notes", value=selected_item['claim_details'] or "")
-                if st.button("Update Claim Status"):
-                    db.update_claim(selected_item['id'], new_claim_status, update_notes)
-                    st.success("Claim status updated successfully!")
+        expense_categories = ["Housing", "Groceries", "Utilities", "Transportation", "Entertainment", "Healthcare", "Dining Out", "Shopping", "Other Expense"]
+
+        with st.form("budget_form"):
+            b_cat = st.selectbox("Category", expense_categories)
+            b_limit = st.number_input("Monthly Limit ($", min_value=0.0, step=50.0, format="%.2f")
+            b_submitted = st.form_submit_button("💾 Save / Update Budget", type="primary")
+            
+            if b_submitted:
+                try:
+                    engine.set_budget(b_cat, float(b_limit))
+                    st.success(f"Budget for '{b_cat}' set to ${b_limit:,.2f} / month!")
                     st.rerun()
+                except ValueError as e:
+                    st.error(str(e))
 
-            with m_col2:
-                st.markdown("### Danger Zone")
-                if st.button("Delete Item", type="primary"):
-                    db.delete_item(selected_item['id'])
-                    st.success("Item deleted successfully!")
-                    st.rerun()
+        st.markdown("### Current Active Budgets")
+        if not df_budgets.empty:
+            st.dataframe(df_budgets, use_container_width=True, hide_index=True)
+        else:
+            st.info("No category budgets defined yet.")
 
+    # ==========================================
+    # PAGE 4: DATA MANAGEMENT & EXPORT
+    # ==========================================
+    elif page == "Data Management":
+        st.title("📤 Data Export & Management")
+        st.markdown("Export your complete financial records to CSV for external analysis or backup.")
+
+        if not df_trans.empty:
+            csv_data = df_trans.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Download Transactions as CSV",
+                data=csv_data,
+                file_name=f"personal_finance_export_{datetime.date.today()}.csv",
+                mime="text/csv",
+                type="primary"
+            )
+            
+            st.markdown("### Preview Export Data")
+            st.dataframe(df_trans, use_container_width=True)
+        else:
+            st.info("No transaction data available for export.")
 
 if __name__ == '__main__':
     main()
