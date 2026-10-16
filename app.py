@@ -1,57 +1,95 @@
-import sqlite3
-import datetime
-import json
 import streamlit as st
-import streamlit.components.v1 as components
+import sqlite3
+import pandas as pd
+from datetime import datetime
+from typing import Dict, List, Any, Optional
 
-DB_NAME = "ping_pong_scores.db"
+DB_NAME = "ping_pong_arcade.db"
 
-class GameEngine:
-    """Backend business logic for managing high scores and match statistics."""
-    
+# --- DATABASE ENGINE & SELF-HEALING SCHEMA ---
+class DatabaseEngine:
     @staticmethod
-    def get_connection():
-        return sqlite3.connect(DB_NAME, check_same_thread=False)
+    def get_connection() -> sqlite3.Connection:
+        conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
 
-    @staticmethod
-    def init_db():
-        conn = GameEngine.get_connection()
+    @classmethod
+    def init_db(cls):
+        conn = cls.get_connection()
         cursor = conn.cursor()
         
-        # Create table if not exists
-        cursor.execute("""
+        # Create tables if not exist
+        cursor.execute('''
             CREATE TABLE IF NOT EXISTS matches (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 player_name TEXT NOT NULL,
                 player_score INTEGER NOT NULL,
                 ai_score INTEGER NOT NULL,
                 difficulty TEXT NOT NULL,
+                winner TEXT NOT NULL,
                 played_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        """
-        )
+        ''')
         
-        # Ensure schema self-healing (check columns)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS high_scores (
+                player_name TEXT PRIMARY KEY,
+                high_score INTEGER NOT NULL,
+                games_played INTEGER NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Defensive column check & migration for matches
         cursor.execute("PRAGMA table_info(matches)")
         columns = [col[1] for col in cursor.fetchall()]
-        
         if "difficulty" not in columns:
             cursor.execute("ALTER TABLE matches ADD COLUMN difficulty TEXT DEFAULT 'Medium'")
             
         conn.commit()
         conn.close()
 
-    @staticmethod
-    def save_match(player_name: str, player_score: int, ai_score: int, difficulty: str) -> bool:
-        if not player_name or not player_name.strip():
-            player_name = "Anonymous"
+    @classmethod
+    def reset_db(cls):
+        conn = cls.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DROP TABLE IF EXISTS matches")
+        cursor.execute(
+            "DROP TABLE IF EXISTS high_scores"
+        )
+        conn.commit()
+        conn.close()
+        cls.init_db()
+
+    @classmethod
+    def save_match(cls, player_name: str, p_score: int, ai_score: int, difficulty: str) -> bool:
         try:
-            conn = GameEngine.get_connection()
+            conn = cls.get_connection()
             cursor = conn.cursor()
+            winner = player_name if p_score > ai_score else ("AI Bot" if ai_score > p_score else "Tie")
+            
             cursor.execute(
-                "INSERT INTO matches (player_name, player_score, ai_score, difficulty, played_at) VALUES (?, ?, ?, ?, ?)",
-                (player_name.strip(), int(player_score), int(ai_score), difficulty, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                "INSERT INTO matches (player_name, player_score, ai_score, difficulty, winner) VALUES (?, ?, ?, ?, ?)",
+                (player_name, p_score, ai_score, difficulty, winner)
             )
+            
+            # Update high scores
+            cursor.execute("SELECT high_score, games_played FROM high_scores WHERE player_name = ?", (player_name,))
+            row = cursor.fetchone()
+            if row:
+                new_high = max(row["high_score"], p_score)
+                new_games = row["games_played"] + 1
+                cursor.execute(
+                    "UPDATE high_scores SET high_score = ?, games_played = ?, updated_at = CURRENT_TIMESTAMP WHERE player_name = ?",
+                    (new_high, new_games, player_name)
+                )
+            else:
+                cursor.execute(
+                    "INSERT INTO high_scores (player_name, high_score, games_played) VALUES (?, ?, 1)",
+                    (player_name, p_score)
+                )
+                
             conn.commit()
             conn.close()
             return True
@@ -59,52 +97,64 @@ class GameEngine:
             print(f"Database error: {e}")
             return False
 
-    @staticmethod
-    def get_leaderboard(limit: int = 10):
+    @classmethod
+    def get_leaderboard(cls) -> pd.DataFrame:
         try:
-            GameEngine.init_db()
-            conn = GameEngine.get_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT player_name, player_score, ai_score, difficulty, played_at FROM matches ORDER BY player_score DESC, played_at DESC LIMIT ?",
-                (limit,)
-            )
-            rows = cursor.fetchall()
+            conn = cls.get_connection()
+            df = pd.read_sql_query("SELECT player_name, high_score, games_played, updated_at FROM high_scores ORDER BY high_score DESC LIMIT 10", conn)
             conn.close()
-            return rows
+            return df
         except Exception:
-            return []
+            return pd.DataFrame(columns=["player_name", "high_score", "games_played", "updated_at"])
 
-    @staticmethod
-    def clear_database():
+    @classmethod
+    def get_match_history(cls) -> pd.DataFrame:
         try:
-            conn = GameEngine.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("DROP TABLE IF EXISTS matches")
-            conn.commit()
+            conn = cls.get_connection()
+            df = pd.read_sql_query("SELECT id, player_name, player_score, ai_score, difficulty, winner, played_at FROM matches ORDER BY played_at DESC LIMIT 20", conn)
             conn.close()
-            GameEngine.init_db()
-            return True
+            return df
         except Exception:
+            return pd.DataFrame(columns=["id", "player_name", "player_score", "ai_score", "difficulty", "winner", "played_at"])
+
+
+# --- BUSINESS LOGIC / GAME VALIDATOR --- 
+class GameValidator:
+    @staticmethod
+    def validate_score(player_score: int, ai_score: int) -> bool:
+        if not isinstance(player_score, int) or not isinstance(ai_score, int):
             return False
+        if player_score < 0 or ai_score < 0:
+            return False
+        return True
+
+    @staticmethod
+    def calculate_match_stats(df_matches: pd.DataFrame) -> Dict[str, Any]:
+        if df_matches.empty:
+            return {"total_matches": 0, "avg_player_score": 0.0, "player_win_rate": 0.0}
+        total = len(df_matches)
+        avg_score = df_matches["player_score"].mean()
+        # Count matches where winner is not AI and not Tie
+        wins = len(df_matches[df_matches["winner"].str.contains(r"AI|Tie", case=False, na=False) == False])
+        win_rate = (wins / total) * 100 if total > 0 else 0.0
+        return {
+            "total_matches": total,
+            "avg_player_score": round(avg_score, 1),
+            "player_win_rate": round(win_rate, 1)
+        }
 
 
-def render_ping_pong_html(difficulty: str):
-    """Generates the complete HTML, CSS, and JS payload for the retro arcade ping pong game."""
-    ai_speed_factor = 0.05
-    if difficulty == "Easy":
-        ai_speed_factor = 0.035
-    elif difficulty == "Hard":
-        ai_speed_factor = 0.075
-    elif difficulty == "Insane":
-        ai_speed_factor = 0.1
+# --- HTML/JS PONG GAME COMPONENT --- 
+def get_pong_html(difficulty: str) -> str:
+    # Map difficulty to AI speed/reaction
+    ai_speeds = {"Easy": 0.04, "Medium": 0.07, "Hard": 0.12, "Legendary": 0.18}
+    ai_speed = ai_speeds.get(difficulty, 0.07)
+    winning_score = 5
 
-    html_content = f"""
+    return f"""
     <!DOCTYPE html>
-    <html lang="en">
+    <html>
     <head>
-        <meta charset="UTF-8">
-        <title>Retro Ping Pong</title>
         <style>
             body {{
                 background-color: #0d1117;
@@ -122,58 +172,64 @@ def render_ping_pong_html(difficulty: str):
                 justify-content: center;
                 height: 100vh;
             }}
-            canvas {{
-                border: 4px solid #30363d;
-                box-shadow: 0 0 20px rgba(88, 166, 255, 0.3);
-                background-color: #010409;
-                display: block;
-            }}
-            .score-board {{
-                font-size: 24px;
-                margin-bottom: 10px;
+            .arcade-header {{
+                font-size: 1.5rem;
+                font-weight: bold;
+                color: #00ffcc;
+                text-shadow: 0 0 10px #00ffcc;
+                margin-bottom: 5px;
                 letter-spacing: 2px;
-                color: #c9d1d9;
             }}
             .instructions {{
-                font-size: 14px;
+                font-size: 0.8rem;
                 color: #8b949e;
-                margin-top: 10px;
+                margin-bottom: 10px;
             }}
-            .btn {{
-                background-color: #238636;
-                color: white;
-                border: none;
-                padding: 10px 20px;
-                font-size: 16px;
-                font-family: 'Courier New', Courier, monospace;
-                cursor: pointer;
+            canvas {{
+                border: 4px solid #00ffcc;
+                box-shadow: 0 0 25px rgba(0, 255, 204, 0.4);
+                background: #000;
                 border-radius: 6px;
-                margin-top: 10px;
-                box-shadow: 0 4px #2ea043;
-                transition: 0.1s;
             }}
-            .btn:active {{
-                transform: translateY(2px);
-                box-shadow: 0 2px #2ea043;
+            .controls-hint {{
+                margin-top: 10px;
+                font-size: 0.85rem;
+                color: #c9d1d9;
+            }}
+            .key {{
+                background: #21262d;
+                border: 1px solid #30363d;
+                padding: 2px 6px;
+                border-radius: 4px;
+                color: #58a6ff;
+                font-weight: bold;
             }}
         </style>
     </head>
     <body>
         <div id="game-container">
-            <div class="score-board">
-                PLAYER: <span id="pScore">0</span> &nbsp;&nbsp;|&nbsp;&nbsp; AI ({difficulty}): <span id="aiScore">0</span>
+            <div class="arcade-header">RETRO PONG ARCADE</div>
+            <div class="instructions">Difficulty: {difficulty} | First to {winning_score} wins!</div>
+            <canvas id="pongCanvas" width="700" height="400"></canvas>
+            <div class="controls-hint">
+                Use <span class="key">▲</span> and <span class="key">▼</span> Arrow Keys or W/S keys to move paddle.
             </div>
-            <canvas id="pong" width="700" height="400"></canvas>
-            <button class="btn" id="startBtn" onclick="startGame()">START MATCH</button>
-            <div class="instructions">Use <b>W / S</b> or <b>Arrow Up / Arrow Down</b> to move paddle. First to 5 wins!</div>
         </div>
 
         <script>
-            const canvas = document.getElementById("pong");
+            const canvas = document.getElementById("pongCanvas");
             const ctx = canvas.getContext("2d");
 
-            let gameRunning = false;
-            let winningScore = 5;
+            // Game objects
+            const ball = {{
+                x: canvas.width / 2,
+                y: canvas.height / 2,
+                radius: 8,
+                speed: 5,
+                velocityX: 5,
+                velocityY: 5,
+                color: "#00ffcc"
+            }};
 
             const player = {{
                 x: 10,
@@ -190,34 +246,40 @@ def render_ping_pong_html(difficulty: str):
                 width: 12,
                 height: 80,
                 score: 0,
-                color: "#f85149"
+                color: "#ff5555"
             }};
 
-            const ball = {{
-                x: canvas.width / 2,
-                y: canvas.height / 2,
-                radius: 8,
-                speed: 5,
-                velocityX: 5,
-                velocityY: 5,
-                color: "#f0f6fc"
-            }};
+            // Controls
+            let upPressed = false;
+            let downPressed = false;
+            let gameStarted = true;
+            let gameOver = false;
+            let winnerText = "";
 
-            let keys = {{}};
-            window.addEventListener('keydown', (e) => {{
-                keys[e.key] = true;
-                if(["ArrowUp","ArrowDown"," ","w","s"].indexOf(e.key) > -1) {{
+            window.addEventListener("keydown", (e) => {{
+                if (e.key === "ArrowUp" || e.key === "w" || e.key === "W") {{
+                    upPressed = true;
                     e.preventDefault();
-                }} 
+                }}
+                if (e.key === "ArrowDown" || e.key === "s" || e.key === "S") {{
+                    downPressed = true;
+                    e.preventDefault();
+                }}
             }});
-            window.addEventListener('keyup', (e) => {{
-                keys[e.key] = false;
+
+            window.addEventListener("keyup", (e) => {{
+                if (e.key === "ArrowUp" || e.key === "w" || e.key === "W") {{
+                    upPressed = false;
+                }}
+                if (e.key === "ArrowDown" || e.key === "s" || e.key === "S") {{
+                    downPressed = false;
+                }}
             }});
 
             function drawRect(x, y, w, h, color) {{
                 ctx.fillStyle = color;
                 ctx.fillRect(x, y, w, h);
-            }};
+            }}
 
             function drawCircle(x, y, r, color) {{
                 ctx.fillStyle = color;
@@ -225,19 +287,20 @@ def render_ping_pong_html(difficulty: str):
                 ctx.arc(x, y, r, 0, Math.PI * 2, false);
                 ctx.closePath();
                 ctx.fill();
-            }};
+            }}
 
-            function drawText(text, x, y, color) {{
+            function drawText(text, x, y, color, font = "20px Courier New") {{
                 ctx.fillStyle = color;
-                ctx.font = "50px 'Courier New'";
+                ctx.font = font;
+                ctx.textAlign = "center";
                 ctx.fillText(text, x, y);
-            }};
+            }}
 
             function drawNet() {{
-                for(let i = 0; i <= canvas.height; i += 15) {{
+                for (let i = 0; i <= canvas.height; i += 15) {{
                     drawRect(canvas.width / 2 - 1, i, 2, 10, "#30363d");
                 }}
-            }};
+            }}
 
             function collision(b, p) {{
                 b.top = b.y - b.radius;
@@ -251,205 +314,224 @@ def render_ping_pong_html(difficulty: str):
                 p.right = p.x + p.width;
 
                 return b.right > p.left && b.bottom > p.top && b.left < p.right && b.top < p.bottom;
-            }};
+            }}
 
             function resetBall() {{
                 ball.x = canvas.width / 2;
                 ball.y = canvas.height / 2;
-                ball.speed = 5;
                 ball.velocityX = -ball.velocityX;
-            }};
+                ball.speed = 5;
+            }}
 
             function update() {{
-                if (!gameRunning) return;
+                if (gameOver) return;
 
                 // Player movement
-                if ((keys['ArrowUp'] || keys['w'] || keys['W']) && player.y > 0) {{
+                if (upPressed && player.y > 0) {{
                     player.y -= 7;
-                }} else if ((keys['ArrowDown'] || keys['s'] || keys['S']) && player.y < canvas.height - player.height) {{
+                }} else if (downPressed && player.y < canvas.height - player.height) {{
                     player.y += 7;
                 }}
 
-                // AI movement with factor {ai_speed_factor}
-                let aiSpeed = {ai_speed_factor} * canvas.height;
-                ai.y += (ball.y - (ai.y + ai.height / 2)) * aiSpeed;
+                // AI movement with difficulty factor
+                let aiSpeedFactor = {ai_speed};
+                ai.y += (ball.y - (ai.y + ai.height / 2)) * aiSpeedFactor;
+                
+                // Restrict AI to canvas
                 if (ai.y < 0) ai.y = 0;
                 if (ai.y > canvas.height - ai.height) ai.y = canvas.height - ai.height;
 
-                // Move ball
+                // Ball movement
                 ball.x += ball.velocityX;
                 ball.y += ball.velocityY;
 
-                // Ball collision with top/bottom walls
+                // Wall collision (Top and Bottom)
                 if (ball.y - ball.radius < 0 || ball.y + ball.radius > canvas.height) {{
                     ball.velocityY = -ball.velocityY;
                 }}
 
-                // Determine active paddle for collision
+                // Paddle collision determination
                 let activePaddle = (ball.x < canvas.width / 2) ? player : ai;
 
                 if (collision(ball, activePaddle)) {{
                     let collidePoint = ball.y - (activePaddle.y + activePaddle.height / 2);
                     collidePoint = collidePoint / (activePaddle.height / 2);
-                    
+
                     let angleRad = (Math.PI / 4) * collidePoint;
                     let direction = (ball.x < canvas.width / 2) ? 1 : -1;
 
                     ball.velocityX = direction * ball.speed * Math.cos(angleRad);
                     ball.velocityY = ball.speed * Math.sin(angleRad);
 
-                    ball.speed += 0.3;
+                    ball.speed += 0.3; // Incremental speed
                 }}
 
                 // Scoring
                 if (ball.x - ball.radius < 0) {{
                     ai.score++;
-                    document.getElementById("aiScore").innerText = ai.score;
-                    checkGameOver();
                     resetBall();
                 }} else if (ball.x + ball.radius > canvas.width) {{
                     player.score++;
-                    document.getElementById("pScore").innerText = player.score;
-                    checkGameOver();
                     resetBall();
                 }}
-            }};
 
-            function checkGameOver() {{
-                if (player.score >= winningScore || ai.score >= winningScore) {{
-                    gameRunning = false;
-                    let winner = player.score >= winningScore ? "PLAYER WINS!" : "AI WINS!";
-                    document.getElementById("startBtn").innerText = "PLAY AGAIN";
-                    document.getElementById("startBtn").style.display = "inline-block";
-                    
-                    console.log("GAMEOVER|" + player.score + "|" + ai.score);
+                // Check Win Condition
+                if (player.score >= {winning_score}) {{
+                    gameOver = true;
+                    winnerText = "PLAYER WINS! 🏆";
+                }} else if (ai.score >= {winning_score}) {{
+                    gameOver = true;
+                    winnerText = "AI WINS! 🤖";
                 }}
-            }};
+            }}
 
             function render() {{
-                drawRect(0, 0, canvas.width, canvas.height, "#010409");
+                // Clear canvas
+                drawRect(0, 0, canvas.width, canvas.height, "#050505");
+                
                 drawNet();
+                
+                // Draw scores
+                drawText(player.score, canvas.width / 4, canvas.height / 5, "#58a6ff", "40px Courier New");
+                drawText(ai.score, 3 * canvas.width / 4, canvas.height / 5, "#ff5555", "40px Courier New");
+
+                // Draw paddles and ball
                 drawRect(player.x, player.y, player.width, player.height, player.color);
                 drawRect(ai.x, ai.y, ai.width, ai.height, ai.color);
                 drawCircle(ball.x, ball.y, ball.radius, ball.color);
-            }};
+
+                if (gameOver) {{
+                    drawRect(0, 0, canvas.width, canvas.height, "rgba(0, 0, 0, 0.85)");
+                    drawText(winnerText, canvas.width / 2, canvas.height / 2 - 20, "#00ffcc", "32px Courier New");
+                    drawText("Match complete! Check Streamlit panel to save score.", canvas.width / 2, canvas.height / 2 + 30, "#8b949e", "14px Courier New");
+                }}
+            }}
 
             function gameLoop() {{
                 update();
                 render();
-                if (gameRunning) {{
-                    requestAnimationFrame(gameLoop);
-                }}
-            }};
+                requestAnimationFrame(gameLoop);
+            }}
 
-            function startGame() {{
-                player.score = 0;
-                ai.score = 0;
-                document.getElementById("pScore").innerText = "0";
-                document.getElementById("aiScore").innerText = "0";
-                player.y = canvas.height / 2 - 40;
-                ai.y = canvas.height / 2 - 40;
-                ball.x = canvas.width / 2;
-                ball.y = canvas.height / 2;
-                ball.speed = 5;
-                ball.velocityX = 5;
-                ball.velocityY = 5;
-                gameRunning = true;
-                document.getElementById("startBtn").style.display = "none";
-                gameLoop();
-            }};
-
-            render();
+            gameLoop();
         </script>
     </body>
     </html>
     """
-    return html_content
 
 
+# --- STREAMLIT USER INTERFACE --- 
 def main():
     st.set_page_config(
         page_title="Retro Arcade Ping Pong",
         page_icon="🏓",
-        layout="centered"
+        layout="wide",
+        initial_sidebar_state="expanded"
     )
 
-    GameEngine.init_db()
+    # Initialize Database
+    DatabaseEngine.init_db()
 
+    # Custom Retro Styling
     st.markdown(
         """
-        <div style='text-align: center;'>
-            <h1 style='color: #58a6ff; font-family: monospace;'>🏓 RETRO ARCADE PING PONG</h1>
-            <p style='color: #8b949e;'>Classic 2D pong with AI opponent, collision physics, and high score tracking.</p>
-        </div>
+        <style>
+            .main-title {
+                font-size: 2.5rem;
+                color: #00ffcc;
+                text-shadow: 0 0 12px rgba(0, 255, 204, 0.6);
+                font-family: 'Courier New', Courier, monospace;
+                font-weight: bold;
+                margin-bottom: 0px;
+            }
+            .subtitle {
+                color: #8b949e;
+                font-size: 1.1rem;
+                margin-bottom: 20px;
+            }
+            .metric-card {
+                background-color: #161b22;
+                border: 1px solid #30363d;
+                padding: 15px;
+                border-radius: 8px;
+                text-align: center;
+            }
+        </style>
         """,
         unsafe_allow_html=True
     )
 
-    with st.sidebar:
-        st.header("🕹️ Game Settings")
-        difficulty = st.selectbox("AI Difficulty", ["Easy", "Medium", "Hard", "Insane"], index=1)
-        player_name = st.text_input("Player Name", value="RetroGamer", max_chars=20)
+    st.markdown('<div class="main-title">🏓 RETRO ARCADE PING PONG</div>', unsafe_allow_html=True)
+    st.markdown('<div class="subtitle">Classic 2-Player arcade showdown against intelligent AI. Built with Streamlit & HTML5 Canvas.</div>', unsafe_allow_html=True)
 
-        st.markdown("---")
-        st.header("💾 Match Saver")
-        st.info("Record your completed match to the arcade leaderboard!")
+    # Sidebar Configuration & Controls
+    st.sidebar.markdown("## 🎮 Arcade Settings")
+    player_name = st.sidebar.text_input("Player Tag / Name", value="Player1", max_chars=20)
+    difficulty = st.sidebar.selectbox("AI Difficulty", ["Easy", "Medium", "Hard", "Legendary"], index=1)
+    
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 💾 Match Saver")
+    st.sidebar.info("Finished a game? Log your score to the arcade high-score board below!")
+    
+    with st.sidebar.form("save_form"):
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            p_score_input = st.number_input("Your Score", min_value=0, max_value=10, value=5)
+        with col_s2:
+            ai_score_input = st.number_input("AI Score", min_value=0, max_value=10, value=2)
         
-        with st.form("score_form"):
-            p_score_input = st.number_input("Player Score", min_value=0, max_value=20, value=5)
-            ai_score_input = st.number_input("AI Score", min_value=0, max_value=20, value=2)
-            submit_score = st.form_submit_button("Save Match Score")
-
-            if submit_score:
-                success = GameEngine.save_match(player_name, p_score_input, ai_score_input, difficulty)
+        submitted = st.form_submit_button("📥 Save Match Result")
+        if submitted:
+            if GameValidator.validate_score(p_score_input, ai_score_input):
+                success = DatabaseEngine.save_match(player_name, p_score_input, ai_score_input, difficulty)
                 if success:
-                    st.success(f"Saved score for {player_name}!")
+                    st.sidebar.success(f"Score saved for {player_name}!")
                 else:
-                    st.error("Failed to save score.")
+                    st.sidebar.error("Failed to save score.")
+            else:
+                st.sidebar.error("Invalid score values provided.")
 
-        st.markdown("---")
-        with st.expander("⚙️ Database Maintenance"):
-            if st.button("Reset Leaderboard DB", type="secondary"):
-                if GameEngine.clear_database():
-                    st.success("Database reset successfully!")
-                    st.rerun()
-                else:
-                    st.error("Error resetting database.")
+    # Database Maintenance
+    with st.sidebar.expander("⚙️ Database & Maintenance"):
+        if st.button("🗑️ Reset Arcade Database", type="primary"):
+            DatabaseEngine.reset_db()
+            st.sidebar.success("Database successfully wiped and re-initialized!")
+            st.rerun()
 
-    tab_game, tab_leaderboard = st.tabs(["🎮 Play Game", "🏆 Leaderboard & History"])
+    # Layout: Game Window & Stats Dashboard
+    col_game, col_dash = st.columns([2.2, 1])
 
-    with tab_game:
-        st.markdown(f"**Current Mode:** `{difficulty}` difficulty | **Player:** `{player_name}`")
-        
-        game_html = render_ping_pong_html(difficulty)
-        components.html(game_html, height=540, scrolling=False)
+    with col_game:
+        st.markdown("### 🕹️ Live Arena")
+        # Embed HTML/JS Game inside Streamlit Component
+        from streamlit.components.v1 import html
+        html(get_pong_html(difficulty), height=480, scrolling=False)
 
-        st.markdown("""
-            ### How to Play:
-            1. Click **START MATCH** inside the game screen.
-            2. Use **W / S** keys or **Arrow Up / Arrow Down** keys to control your paddle (Left).
-            3. First player to reach **5 points** wins the match!
-            4. Use the sidebar form to log your victories into the permanent leaderboard.
-        """)
-
-    with tab_leaderboard:
-        st.subheader("🏆 Arcade Hall of Fame")
-        leaderboard_data = GameEngine.get_leaderboard(limit=15)
-        
-        if leaderboard_data:
-            formatted_data = []
-            for row in leaderboard_data:
-                formatted_data.append({
-                    "Player": row[0],
-                    "Player Score": row[1],
-                    "AI Score": row[2],
-                    "Difficulty": row[3],
-                    "Date / Time": row[4]
-                })
-            st.dataframe(formatted_data, use_container_width=True)
+    with col_dash:
+        st.markdown("### 🏆 Arcade Leaderboard")
+        df_leaderboard = DatabaseEngine.get_leaderboard()
+        if not df_leaderboard.empty:
+            st.dataframe(df_leaderboard, use_container_width=True, hide_index=True)
         else:
-            st.info("No matches recorded yet. Play a match or record one via the sidebar!")
+            st.info("No high scores recorded yet. Be the first!")
+
+        st.markdown("### 📈 Career Statistics")
+        df_matches = DatabaseEngine.get_match_history()
+        stats = GameValidator.calculate_match_stats(df_matches)
+        
+        m1, m2 = st.columns(2)
+        m1.metric("Total Matches", stats["total_matches"])
+        m2.metric(
+            "Win Rate", f"{stats['player_win_rate']}%")
+
+    # Full Match History Table
+    st.markdown("---")
+    st.markdown("### 📜 Recent Match History")
+    if not df_matches.empty:
+        st.dataframe(df_matches, use_container_width=True, hide_index=True)
+    else:
+        st.markdown("*No recent match history available.*")
 
 
-if __name__ == "__main__":
+if __name__ == "__mainmain__" or __name__ == "__main__":
     main()
