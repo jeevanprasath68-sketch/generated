@@ -1,289 +1,343 @@
-import sqlite3
-import datetime
-from typing import List, Dict, Any, Optional
 import streamlit as st
+import sqlite3
+from datetime import datetime
+import pandas as pd
+import os
+from typing import List, Dict, Any, Optional
 
-# ==========================================
-# BUSINESS LOGIC & DATA ENGINE
-# ==========================================
+DB_FILE = "campus_find.db"
 
-class CampusDatabase:
-    def __init__(self, db_path: str = "campusfind.db"):
+class DatabaseEngine:
+    def __init__(self, db_path: str = DB_FILE):
         self.db_path = db_path
-        self._init_db()
+        self.init_db()
 
-    def _get_connection(self) -> sqlite3.Connection:
+    def get_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
 
-    def _init_db(self) -> None:
-        with self._get_connection() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS items (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title TEXT NOT NULL,
-                    description TEXT NOT NULL,
-                    category TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    location TEXT NOT NULL,
-                    date_reported TEXT NOT NULL,
-                    reporter_name TEXT NOT NULL,
-                    reporter_contact TEXT NOT NULL,
-                    claim_status TEXT DEFAULT 'Unclaimed',
-                    claim_notes TEXT DEFAULT ''
-                )
-                """
+    def init_db(self):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        # Create table if not exists
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                category TEXT NOT NULL,
+                status TEXT NOT NULL,
+                location TEXT NOT NULL,
+                date_lost_found TEXT NOT NULL,
+                description TEXT,
+                contact_info TEXT NOT NULL,
+                claim_status TEXT DEFAULT 'Unclaimed',
+                claim_details TEXT,
+                created_at TEXT NOT NULL
             )
-            # Self-healing schema migration: add any missing columns if migrating an older database
-            cursor = conn.cursor()
-            cursor.execute("PRAGMA table_info(items)")
-            columns = [row[1] for row in cursor.fetchall()]
-            if "claim_status" not in columns:
-                cursor.execute("ALTER TABLE items ADD COLUMN claim_status TEXT DEFAULT 'Unclaimed'")
-            if "claim_notes" not in columns:
-                cursor.execute("ALTER TABLE items ADD COLUMN claim_notes TEXT DEFAULT ''")
-            conn.commit()
-
-    def reset_db(self) -> None:
-        """Wipes all data and re-initializes fresh tables."""
-        with self._get_connection() as conn:
-            conn.execute("DROP TABLE IF EXISTS items")
-            conn.commit()
-        self._init_db()
+        ''')
+        conn.commit()
+        
+        # Defensive schema migration: ensure all expected columns exist
+        expected_columns = {
+            "title": "TEXT NOT NULL DEFAULT ''",
+            "category": "TEXT NOT NULL DEFAULT 'Other'",
+            "status": "TEXT NOT NULL DEFAULT 'Lost'",
+            "location": "TEXT NOT NULL DEFAULT ''",
+            "date_lost_found": "TEXT NOT NULL DEFAULT ''",
+            "description": "TEXT DEFAULT ''",
+            "contact_info": "TEXT NOT NULL DEFAULT ''",
+            "claim_status": "TEXT DEFAULT 'Unclaimed'",
+            "claim_details": "TEXT DEFAULT ''",
+            "created_at": "TEXT NOT NULL DEFAULT ''"
+        }
+        
+        cursor.execute("PRAGMA table_info(items)")
+        existing_cols = {row[1] for row in cursor.fetchall()}
+        
+        for col_name, col_def in expected_columns.items():
+            if col_name not in existing_cols:
+                cursor.execute(f"ALTER TABLE items ADD COLUMN {col_name} {col_def}")
+        
+        conn.commit()
+        conn.close()
 
     def add_item(self, data: Dict[str, Any]) -> int:
-        required_fields = ['title', 'description', 'category', 'status', 'location', 'reporter_name', 'reporter_contact']
-        for field in required_fields:
-            if not data.get(field):
-                raise ValueError(f"Missing required field: {field}")
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO items (title, category, status, location, date_lost_found, description, contact_info, claim_status, claim_details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            data.get("title"),
+            data.get("category"),
+            data.get("status"),
+            data.get("location"),
+            data.get("date_lost_found"),
+            data.get("description", ""),
+            data.get("contact_info"),
+            data.get("claim_status", "Unclaimed"),
+            data.get("claim_details", ""),
+            datetime.now().isoformat()
+        ))
+        conn.commit()
+        item_id = cursor.lastrowid
+        conn.close()
+        return item_id
 
-        date_reported = data.get('date_reported', datetime.date.today().isoformat())
-        
-        with self._get_connection() as conn:
+    def get_items(self, search: str = "", category: str = "All", status: str = "All", claim_status: str = "All") -> List[Dict[str, Any]]:
+        try:
+            conn = self.get_connection()
             cursor = conn.cursor()
-            cursor.execute(
-                """
-                INSERT INTO items (title, description, category, status, location, date_reported, reporter_name, reporter_contact, claim_status, claim_notes)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Unclaimed', '')
-                """,
-                (
-                    data['title'],
-                    data['description'],
-                    data['category'],
-                    data['status'],
-                    data['location'],
-                    date_reported,
-                    data['reporter_name'],
-                    data['reporter_contact']
-                )
-            )
-            conn.commit()
-            return cursor.lastrowid
-
-    def get_items(self, search_query: str = "", category: str = "All", status: str = "All") -> List[Dict[str, Any]]:
-        with self._get_connection() as conn:
             query = "SELECT * FROM items WHERE 1=1"
             params = []
 
-            if search_query:
+            if search:
                 query += " AND (title LIKE ? OR description LIKE ? OR location LIKE ?)"
-                like_term = f"%{search_query}%"
+                like_term = f"%{search}%"
                 params.extend([like_term, like_term, like_term])
 
-            if category != "All":
+            if category and category != "All":
                 query += " AND category = ?"
                 params.append(category)
 
-            if status != "All":
+            if status and status != "All":
                 query += " AND status = ?"
                 params.append(status)
 
-            query += " ORDER BY date_reported DESC, id DESC"
-            cursor = conn.execute(query, params)
-            return [dict(row) for row in cursor.fetchall()]
+            if claim_status and claim_status != "All":
+                query += " AND claim_status = ?"
+                params.append(claim_status)
 
-    def update_claim(self, item_id: int, claim_status: str, claim_notes: str) -> bool:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                UPDATE items SET claim_status = ?, claim_notes = ? WHERE id = ?
-                """,
-                (claim_status, claim_notes, item_id)
-            )
-            conn.commit()
-            return cursor.rowcount > 0
+            query += " ORDER BY id DESC"
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            conn.close()
+            return [dict(row) for row in rows]
+        except sqlite3.OperationalError:
+            self.init_db()
+            return self.get_items(search, category, status, claim_status)
 
-    def get_stats(self) -> Dict[str, int]:
-        with self._get_connection() as conn:
-            try:
-                total = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
-                lost = conn.execute("SELECT COUNT(*) FROM items WHERE status='Lost'").fetchone()[0]
-                found = conn.execute("SELECT COUNT(*) FROM items WHERE status='Found'").fetchone()[0]
-                claimed = conn.execute("SELECT COUNT(*) FROM items WHERE claim_status='Claimed'").fetchone()[0]
-            except sqlite3.OperationalError:
-                # Self-heal schema if missing columns or tables
-                self._init_db()
-                total = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
-                lost = conn.execute("SELECT COUNT(*) FROM items WHERE status='Lost'").fetchone()[0]
-                found = conn.execute("SELECT COUNT(*) FROM items WHERE status='Found'").fetchone()[0]
-                claimed = conn.execute("SELECT COUNT(*) FROM items WHERE claim_status='Claimed'").fetchone()[0]
-            return {
-                "total": total,
-                "lost": lost,
-                "found": found,
-                "claimed": claimed
-            }
+    def update_claim(self, item_id: int, claim_status: str, claim_details: str) -> bool:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE items SET claim_status = ?, claim_details = ? WHERE id = ?
+        ''', (claim_status, claim_details, item_id))
+        conn.commit()
+        updated = cursor.rowcount > 0
+        conn.close()
+        return updated
 
-# ==========================================
-# STREAMLIT USER INTERFACE
-# ==========================================
+    def delete_item(self, item_id: int) -> bool:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM items WHERE id = ?", (item_id,))
+        conn.commit()
+        deleted = cursor.rowcount > 0
+        conn.close()
+        return deleted
+
+    def reset_database(self):
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+        self.init_db()
+
+
+class ItemValidator:
+    @staticmethod
+    def validate_item_submission(data: Dict[str, Any]) -> List[str]:
+        errors = []
+        if not data.get("title", "").strip():
+            errors.append("Title is required.")
+        if not data.get("category", "").strip():
+            errors.append("Category is required.")
+        if not data.get("location", "").strip():
+            errors.append("Location is required.")
+        if not data.get("contact_info", "").strip():
+            errors.append("Contact Information is required.")
+        return errors
+
 
 def main():
     st.set_page_config(
-        page_title="CampusFind - Lost & Found",
+        page_title="CampusFind — College Lost & Found Portal",
         page_icon="🎒",
         layout="wide"
     )
 
-    db = CampusDatabase()
+    db = DatabaseEngine()
 
-    # App Header
-    st.title("🎒 CampusFind — College Lost & Found Portal")
-    st.markdown("Welcome to the central hub for reporting, searching, and claiming lost items on campus.")
+    # Sidebar Navigation and DB Management
+    st.sidebar.title("🎒 CampusFind")
+    st.sidebar.markdown("Find what you lost, return what you found.")
+    
+    page = st.sidebar.radio("Navigation", ["Browse Portal", "Report Lost/Found Item", "Manage Claims & Items"])
 
-    # Sidebar Navigation
-    st.sidebar.title("Navigation")
-    choice = st.sidebar.radio("Go to", ["Browse & Search", "Report Item", "Manage Claims / Status", "Dashboard Stats"])
-
-    st.sidebar.divider()
-    with st.sidebar.expander("⚙️ Database Management"):
-        st.caption("Clear stale test data or re-initialize a fresh database.")
-        if st.sidebar.button("🗑️ Reset Database / Clear All Data", use_container_width=True):
-            db.reset_db()
-            st.sidebar.success("Database wiped & schema re-initialized!")
+    st.sidebar.markdown("---")
+    with st.sidebar.expander("⚙️ Database Settings"):
+        if st.button("Reset Database / Wipe All", type="primary"):
+            db.reset_database()
+            st.success("Database successfully reset!")
             st.rerun()
 
-    CATEGORIES = ["All", "Electronics", "Books & Notes", "ID & Cards", "Clothing", "Keys", "Bags", "Other"]
-    STATUSES = ["All", "Lost", "Found"]
+    categories = ["All", "Electronics", "ID / Cards", "Keys", "Clothing", "Books & Notes", "Bags / Wallets", "Other"]
+    statuses = ["All", "Lost", "Found"]
+    claim_statuses = ["All", "Unclaimed", "Claim Pending", "Resolved"]
 
-    if choice == "Browse & Search":
-        st.header("🔍 Browse & Search Lost/Found Items")
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            search_query = st.text_input("Search keywords", placeholder="e.g., iPhone, Calculator, Library...")
-        with col2:
-            selected_category = st.selectbox("Category", CATEGORIES)
-        with col3:
-            selected_status = st.selectbox("Item Status", STATUSES)
+    if page == "Browse Portal":
+        st.title("🔍 Campus Lost & Found Portal")
+        st.markdown("Search through items reported lost or found across campus.")
 
-        items = db.get_items(search_query=search_query, category=selected_category, status=selected_status)
+        # Metrics row
+        all_items = db.get_items()
+        total_items = len(all_items)
+        lost_count = sum(1 for i in all_items if i['status'] == 'Lost')
+        found_count = sum(1 for i in all_items if i['status'] == 'Found')
+        resolved_count = sum(1 for i in all_items if i['claim_status'] == 'Resolved')
 
-        st.markdown(f"**Found {len(items)} matching item(s)**")
-        st.divider()
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Items", total_items)
+        col2.metric("Lost Items", lost_count)
+        col3.metric("Found Items", found_count)
+        col4.metric("Resolved Claims", resolved_count)
 
-        if not items:
-            st.info("No items found matching your criteria.")
+        st.markdown("---")
+
+        # Search and Filters
+        f_col1, f_col2, f_col3, f_col4 = st.columns(4)
+        with f_col1:
+            search_query = st.text_input("Search keyword", placeholder="e.g. iPhone, Keys...")
+        with f_col2:
+            sel_category = st.selectbox("Category", categories)
+        with f_col3:
+            sel_status = st.selectbox("Status", statuses)
+        with f_col4:
+            sel_claim = st.selectbox("Claim Status", claim_statuses)
+
+        filtered_items = db.get_items(search=search_query, category=sel_category, status=sel_status, claim_status=sel_claim)
+
+        st.markdown(f"### Results ({len(filtered_items)} items found)")
+
+        if not filtered_items:
+            st.info("No items match your search criteria.")
         else:
-            for item in items:
+            for item in filtered_items:
                 with st.container():
-                    cols = st.columns([3, 1, 1])
-                    with cols[0]:
-                        badge = "🔴 Lost" if item['status'] == 'Lost' else "🟢 Found"
-                        st.subheader(f"{badge}: {item['title']}")
-                        st.write(f"**Description:** {item['description']}")
-                        st.write(f"📍 **Location:** {item['location']} | 🏷️ **Category:** {item['category']} | 📅 **Date:** {item['date_reported']}")
-                    with cols[1]:
-                        st.write(f"**Reporter:**\n{item['reporter_name']}\n{item['reporter_contact']}")
-                    with cols[2]:
-                        claim_badge = f"📌 {item['claim_status']}"
-                        st.markdown(f"**Claim Status:**\n{claim_badge}")
-                        if item['claim_notes']:
-                            st.caption(f"Notes: {item['claim_notes']}")
+                    badge_color = "orange" if item["status"] == "Lost" else "green"
+                    claim_color = "red" if item["claim_status"] == "Unclaimed" else ("blue" if item["claim_status"] == "Claim Pending" else "green")
+                    
+                    col_a, col_b = st.columns([3, 1])
+                    with col_a:
+                        st.markdown(f"#### {item['title']} :blue-badge[{item['category']}] :orange-badge[{item['status']}] :violet-badge[{item['claim_status']}]")
+                        st.write(f"📍 **Location:** {item['location']} | 📅 **Date:** {item['date_lost_found']}")
+                        if item["description"]:
+                            st.write(f"📝 {item['description']}")
+                    with col_b:
+                        st.markdown(f"**Contact:** `{item['contact_info']}`")
+                        if item["claim_status"] != "Resolved":
+                            if st.button(f"Claim / Inquire #{item['id']}", key=f"claim_btn_{item['id']}"):
+                                st.session_state[f"claiming_{item['id']}"] = True
+                        else:
+                            st.success("Resolved ✓")
+
+                    # Claim dialog expansion inline
+                    if st.session_state.get(f"claiming_{item['id']}", False):
+                        with st.form(key=f"claim_form_{item['id']}"):
+                            st.markdown(f"**Submit Claim Details for Item #{item['id']}: {item['title']}**")
+                            claimant_info = st.text_input("Your Name & Student ID / Email")
+                            proof_details = st.text_area("Provide identifying details / proof of ownership")
+                            sub_c1, sub_c2 = st.columns(2)
+                            submit_claim = sub_c1.form_submit_button("Submit Claim Request")
+                            cancel_claim = sub_c2.form_submit_button("Cancel")
+
+                            if submit_claim:
+                                if not claimant_info or not proof_details:
+                                    st.error("Please provide both your identity and proof details.")
+                                else:
+                                    full_claim_info = f"Claimant: {claimant_info} | Proof: {proof_details}"
+                                    db.update_claim(item["id"], "Claim Pending", full_claim_info)
+                                    st.success("Claim submitted successfully! The finder/admin will review it.")
+                                    st.session_state[f"claiming_{item['id']}"] = False
+                                    st.rerun()
+                            if cancel_claim:
+                                st.session_state[f"claiming_{item['id']}"] = False
+                                st.rerun()
+
                     st.divider()
 
-    elif choice == "Report Item":
-        st.header("📢 Report a Lost or Found Item")
-        st.markdown("Please fill out the form accurately to help community members reconnect with their belongings.")
+    elif page == "Report Lost/Found Item":
+        st.title("📝 Report a Lost or Found Item")
+        st.markdown("Fill out the details below to list an item on CampusFind.")
 
         with st.form("report_form"):
-            col1, col2 = st.columns(2)
-            with col1:
-                title = st.text_input("Item Title*", placeholder="e.g., Blue Hydro Flask")
-                category = st.selectbox("Category", [c for c in CATEGORIES if c != "All"])
+            r_col1, r_col2 = st.columns(2)
+            with r_col1:
+                title = st.text_input("Item Title / Name*")
+                category = st.selectbox("Category", [c for c in categories if c != "All"])
                 status = st.selectbox("Status", ["Lost", "Found"])
-                location = st.text_input("Location (Lost or Found)*", placeholder="e.g., Student Union 2nd Floor")
-            
-            with col2:
-                reporter_name = st.text_input("Your Name*", placeholder="e.g., Jane Doe")
-                reporter_contact = st.text_input("Your Email / Phone*", placeholder="e.g., jane@college.edu")
-                date_reported = st.date_input("Date", datetime.date.today())
-                description = st.text_area("Detailed Description*", placeholder="Color, brand, distinguishing marks...")
+                date_lost_found = st.date_input("Date Lost / Found", datetime.now())
+            with r_col2:
+                location = st.text_input("Location (e.g. Library 2nd Floor, Student Union)*")
+                contact_info = st.text_input("Contact Info (Email / Phone)*")
+                description = st.text_area("Detailed Description (Color, Brand, Unique marks)")
 
-            submitted = st.form_submit_button("Submit Report")
+            submitted = st.form_submit_button("Publish Item")
 
             if submitted:
-                try:
-                    item_data = {
-                        "title": title,
-                        "description": description,
-                        "category": category,
-                        "status": status,
-                        "location": location,
-                        "date_reported": date_reported.isoformat(),
-                        "reporter_name": reporter_name,
-                        "reporter_contact": reporter_contact
-                    }
-                    db.add_item(item_data)
-                    st.success("✅ Item successfully reported and saved to database!")
-                except ValueError as e:
-                    st.error(f"❌ Error: {e}")
+                item_data = {
+                    "title": title,
+                    "category": category,
+                    "status": status,
+                    "location": location,
+                    "date_lost_found": str(date_lost_found),
+                    "description": description,
+                    "contact_info": contact_info
+                }
+                errors = ItemValidator.validate_item_submission(item_data)
+                if errors:
+                    for err in errors:
+                        st.error(err)
+                else:
+                    item_id = db.add_item(item_data)
+                    st.success(f"Item successfully reported with ID #{item_id}!")
 
-    elif choice == "Manage Claims / Status":
-        st.header("🛠️ Manage Claim Status")
-        st.markdown("Update the claim status of items as they are returned to their owners.")
+    elif page == "Manage Claims & Items":
+        st.title("⚙️ Manage Claims & Status")
+        st.markdown("Review pending claims, update item status to resolved, or remove outdated entries.")
 
         items = db.get_items()
         if not items:
-            st.info("No items available in the system to manage.")
+            st.info("No items in the database.")
         else:
-            item_options = {f"{i['id']}: {i['title']} ({i['status']})": i['id'] for i in items}
-            selected_option = st.selectbox("Select Item", list(item_options.keys()))
-            selected_id = item_options[selected_option]
+            item_options = {f"#{item['id']} - {item['title']} ({item['status']}) [{item['claim_status']}]": item for item in items}
+            selected_label = st.selectbox("Select Item to Manage", list(item_options.keys()))
+            selected_item = item_options[selected_label]
 
-            current_item = next(i for i in items if i['id'] == selected_id)
+            st.markdown(f"### Managing Item #{selected_item['id']}: {selected_item['title']}")
+            st.write(f"**Category:** {selected_item['category']} | **Status:** {selected_item['status']}")
+            st.write(f"**Location:** {selected_item['location']} | **Date:** {selected_item['date_lost_found']}")
+            st.write(f"**Contact:** {selected_item['contact_info']}")
+            st.write(f"**Description:** {selected_item['description']}")
+            st.info(f"**Current Claim Status:** {selected_item['claim_status']}\n\n**Claim Details:** {selected_item['claim_details'] or 'None'}")
 
-            with st.form("claim_form"):
-                st.write(f"**Current Claim Status:** {current_item['claim_status']}")
-                new_claim_status = st.selectbox("Update Claim Status", ["Unclaimed", "Pending Verification", "Claimed"])
-                new_claim_notes = st.text_area("Claim Notes / Handover Details", value=current_item['claim_notes'])
-                update_submitted = st.form_submit_button("Update Status")
-
-                if update_submitted:
-                    db.update_claim(selected_id, new_claim_status, new_claim_notes)
-                    st.success("✅ Claim status successfully updated!")
+            m_col1, m_col2 = st.columns(2)
+            with m_col1:
+                new_claim_status = st.selectbox("Update Claim Status", ["Unclaimed", "Claim Pending", "Resolved"], index=["Unclaimed", "Claim Pending", "Resolved"].index(selected_item['claim_status']) if selected_item['claim_status'] in ["Unclaimed", "Claim Pending", "Resolved"] else 0)
+                update_notes = st.text_input("Claim Resolution Notes", value=selected_item['claim_details'] or "")
+                if st.button("Update Claim Status"):
+                    db.update_claim(selected_item['id'], new_claim_status, update_notes)
+                    st.success("Claim status updated successfully!")
                     st.rerun()
 
-    elif choice == "Dashboard Stats":
-        st.header("📊 Portal Analytics & Summary")
-        stats = db.get_stats()
+            with m_col2:
+                st.markdown("### Danger Zone")
+                if st.button("Delete Item", type="primary"):
+                    db.delete_item(selected_item['id'])
+                    st.success("Item deleted successfully!")
+                    st.rerun()
 
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total Items", stats["total"])
-        col2.metric("Lost Items Reported", stats["lost"])
-        col3.metric("Found Items Reported", stats["found"])
-        col4.metric("Successfully Claimed", stats["claimed"])
-
-        st.divider()
-        st.markdown("### Quick Guidelines")
-        st.markdown("""
-        - **Lost an Item?** File a report immediately with detailed identifiers.
-        - **Found an Item?** Drop it off at Campus Security or Student Services, and report it here.
-        - **Claiming:** Provide proof of ownership (student ID, serial number) when contacting the reporter or administrator.
-        """)
 
 if __name__ == '__main__':
     main()
