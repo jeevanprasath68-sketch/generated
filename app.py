@@ -1,799 +1,858 @@
+"""
+Galaxy Space Shooter Arcade Game
+Built with Streamlit, HTML5 Canvas, Web Audio API, and SQLite Persistence.
+"""
+
 import os
 import sqlite3
 import streamlit as st
 import streamlit.components.v1 as components
 
-DB_PATH = "space_shooter_scores.db"
+DB_PATH = "leaderboard.sqlite"
 
-class GameConfig:
-    @staticmethod
-    def get_difficulty_settings(difficulty: str) -> dict:
-        settings = {
-            "Casual": {"speed_mult": 0.8, "enemy_spawn_rate": 0.02, "score_mult": 1.0, "player_lives": 5},
-            "Standard": {"speed_mult": 1.0, "enemy_spawn_rate": 0.035, "score_mult": 1.5, "player_lives": 3},
-            "Pro": {"speed_mult": 1.3, "enemy_spawn_rate": 0.05, "score_mult": 2.0, "player_lives": 3},
-            "Impossible": {"speed_mult": 1.7, "enemy_spawn_rate": 0.07, "score_mult": 3.0, "player_lives": 2}
-        }
-        return settings.get(difficulty, settings["Standard"])
+# ==========================================
+# BACKEND ENGINE & DATABASE CLASSES
+# ==========================================
 
 class LeaderboardDB:
-    def __init__(self, db_path: str = DB_PATH):
+    """Handles SQLite persistence for high scores with automatic schema migration."""
+    def __init__(self, db_path=DB_PATH):
         self.db_path = db_path
         self.init_db()
 
     def get_connection(self):
-        return sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path)
+        return conn
 
     def init_db(self):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS scores (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                score INTEGER NOT NULL,
-                difficulty TEXT NOT NULL,
-                date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        conn.commit()
-
-        # Self-healing migration check
-        cursor.execute("PRAGMA table_info(scores)")
-        columns = [col[1] for col in cursor.fetchall()]
-        if "difficulty" not in columns:
-            cursor.execute("ALTER TABLE scores ADD COLUMN difficulty TEXT DEFAULT 'Standard'")
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS scores (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    player_name TEXT NOT NULL,
+                    score INTEGER NOT NULL,
+                    difficulty TEXT NOT NULL,
+                    date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            ''')
             conn.commit()
-        if "date" not in columns:
-            cursor.execute("ALTER TABLE scores ADD COLUMN date TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-            conn.commit()
-        conn.close()
+            # Self-healing schema check
+            cursor.execute("PRAGMA table_info(scores);")
+            columns = [col[1] for col in cursor.fetchall()]
+            if "difficulty" not in columns:
+                cursor.execute("ALTER TABLE scores ADD COLUMN difficulty TEXT DEFAULT 'Standard';")
+                conn.commit()
 
-    def add_score(self, name: str, score: int, difficulty: str = "Standard") -> bool:
-        if not name or not name.strip():
-            return False
-        try:
-            conn = self.get_connection()
+    def add_score(self, player_name: str, score: int, difficulty: str) -> int:
+        if not player_name or not player_name.strip():
+            player_name = "Anonymous"
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO scores (name, score, difficulty) VALUES (?, ?, ?)",
-                (name.strip()[:20], int(score), difficulty)
+                "INSERT INTO scores (player_name, score, difficulty) VALUES (?, ?, ?);",
+                (player_name.strip()[:20], int(score), str(difficulty))
             )
             conn.commit()
-            conn.close()
-            return True
-        except Exception:
-            return False
+            return cursor.lastrowid
 
-    def get_top_scores(self, limit: int = 10) -> list:
-        try:
-            conn = self.get_connection()
+    def get_top_scores(self, limit=10, difficulty=None):
+        with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                "SELECT name, score, difficulty, date FROM scores ORDER BY score DESC LIMIT ?",
-                (limit,)
-            )
-            rows = cursor.fetchall()
-            conn.close()
-            return rows
-        except Exception:
-            return []
+            if difficulty and difficulty != "All":
+                cursor.execute(
+                    "SELECT player_name, score, difficulty, date FROM scores WHERE difficulty = ? ORDER BY score DESC LIMIT ?;",
+                    (difficulty, limit)
+                )
+            else:
+                cursor.execute(
+                    "SELECT player_name, score, difficulty, date FROM scores ORDER BY score DESC LIMIT ?;",
+                    (limit,)
+                )
+            return cursor.fetchall()
 
-    def get_stats(self) -> dict:
-        try:
-            conn = self.get_connection()
+    def get_stats(self):
+        with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*), MAX(score), AVG(score) FROM scores")
+            cursor.execute("SELECT COUNT(*), MAX(score), AVG(score) FROM scores;")
             row = cursor.fetchone()
-            conn.close()
             if row and row[0] > 0:
-                return {
-                    "total_games": row[0],
-                    "high_score": row[1] if row[1] is not None else 0,
-                    "avg_score": int(row[2]) if row[2] is not None else 0
-                }
-        except Exception:
-            pass
-        return {"total_games": 0, "high_score": 0, "avg_score": 0}
+                return {"total_games": row[0], "high_score": row[1] or 0, "avg_score": int(row[2] or 0)}
+            return {"total_games": 0, "high_score": 0, "avg_score": 0}
 
-    def reset_leaderboard(self):
-        try:
-            conn = self.get_connection()
+    def reset_database(self):
+        with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("DROP TABLE IF EXISTS scores")
+            cursor.execute("DROP TABLE IF EXISTS scores;")
             conn.commit()
-            conn.close()
-            self.init_db()
-            return True
-        except Exception:
-            return False
+        self.init_db()
 
-# Instantiate DB engine
-db = LeaderboardDB()
 
-def get_arcade_html(difficulty: str) -> str:
-    settings = GameConfig.get_difficulty_settings(difficulty)
-    # We carefully construct the HTML/JS string without unescaped python f-string variables inside JS template literals.
-    html_template = """<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-  body, html {
-    margin: 0; padding: 0; width: 100%; height: 100%;
-    background: #060814; overflow: hidden;
-    font-family: 'Courier New', monospace;
-    color: #00f3ff;
-  }
-  #game-container {
-    position: relative;
-    width: 100%;
-    height: 640px;
-    display: flex;
-    justify-content: center;
-    align-items: center;
-  }
-  canvas {
-    background: #060814;
-    box-shadow: 0 0 30px rgba(0, 243, 255, 0.2);
-    cursor: crosshair;
-  }
-  #hud-overlay {
-    position: absolute;
-    top: 15px;
-    left: 20px;
-    right: 20px;
-    display: flex;
-    justify-content: space-between;
-    pointer-events: none;
-    font-size: 16px;
-    font-weight: bold;
-    text-shadow: 0 0 8px #00f3ff;
-    z-index: 10;
-  }
-</style>
-</head>
-<body>
-<div id="game-container">
-  <div id="hud-overlay">
-    <div>SCORE: <span id="lbl-score">0</span></div>
-    <div>WAVE: <span id="lbl-wave">1</span></div>
-    <div>SHIELD: <span id="lbl-shield">OFF</span></div>
-    <div>LIVES: <span id="lbl-lives">__LIVES__</span></div>
-  </div>
-  <canvas id="cvs" width="800" height="640"></canvas>
-</div>
-
-<script>
-const canvas = document.getElementById('cvs');
-const ctx = canvas.getContext('2d');
-
-// Difficulty settings from Python
-const DIFF_SPEED = __SPEED_MULT__;
-const SPAWN_RATE = __SPAWN_RATE__;
-const SCORE_MULT = __SCORE_MULT__;
-const INIT_LIVES = __LIVES__;
-
-// Audio Synthesizer via Web Audio API
-const AudioEngine = {
-    ctx: null,
-    muted: false,
-    init() {
-        if (!this.ctx) {
-            const AC = window.AudioContext || window.webkitAudioContext;
-            if (AC) this.ctx = new AC();
-        }
-        if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
-    },
-    playTone(freq, type, duration, endFreq) {
-        if (this.muted) return;
-        try {
-            this.init();
-            if (!this.ctx) return;
-            const osc = this.ctx.createOscillator();
-            const gain = this.ctx.createGain();
-            osc.type = type || 'sine';
-            osc.frequency.setValueAtTime(freq, this.ctx.currentTime);
-            if (endFreq) osc.frequency.exponentialRampToValueAtTime(endFreq, this.ctx.currentTime + duration);
-            gain.gain.setValueAtTime(0.15, this.ctx.currentTime);
-            gain.gain.exponentialRampToValueAtTime(0.001, this.ctx.currentTime + duration);
-            osc.connect(gain);
-            gain.connect(this.ctx.destination);
-            osc.start();
-            osc.stop(this.ctx.currentTime + duration);
-        } catch(e) {}
-    },
-    hit() { this.playTone(420, 'square', 0.06, 200); },
-    score() { this.playTone(523, 'sine', 0.1); setTimeout(() => this.playTone(659, 'sine', 0.15), 80); },
-    laser() { this.playTone(880, 'sawtooth', 0.08, 220); },
-    explode() { this.playTone(180, 'triangle', 0.25, 40); },
-    gameOver() { this.playTone(330, 'sawtooth', 0.2, 165); },
-    powerup() { this.playTone(440, 'sine', 0.1); setTimeout(() => this.playTone(880, 'sine', 0.2), 100); }
-};
-
-// Game States: 'MENU', 'PLAYING', 'PAUSED', 'GAMEOVER'
-let gameState = 'MENU';
-let score = 0;
-let wave = 1;
-let lives = INIT_LIVES;
-let shakeTimer = 0;
-let keys = {};
-let mouse = { x: 400, y: 520, down: false };
-
-// Entities
-let player = {
-    x: 400,
-    y: 540,
-    w: 36,
-    h: 28,
-    speed: 7 * DIFF_SPEED,
-    shield: false,
-    shieldTimer: 0,
-    multishot: false,
-    multishotTimer: 0,
-    cooldown: 0
-};
-
-let lasers = [];
-let enemies = [];
-let particles = [];
-let powerups = [];
-let stars = [];
-
-// Init Starfield Background
-for(let i=0; i<80; i++) {
-    stars.push({
-        x: Math.random() * canvas.width,
-        y: Math.random() * canvas.height,
-        size: Math.random() * 2 + 0.5,
-        speed: Math.random() * 1.5 + 0.5
-    });
-}
-
-// Input listeners
-window.addEventListener('keydown', e => {
-    AudioEngine.init();
-    keys[e.code] = true;
-    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) {
-        e.preventDefault();
-    }
-    if (e.code === 'KeyP') {
-        if (gameState === 'PLAYING') gameState = 'PAUSED';
-        else if (gameState === 'PAUSED') gameState = 'PLAYING';
-    }
-    if ((e.code === 'Space' || e.code === 'Enter') && (gameState === 'MENU' || gameState === 'GAMEOVER')) {
-        resetGame();
-        gameState = 'PLAYING';
-    }
-});
-
-window.addEventListener('keyup', e => { keys[e.code] = false; });
-
-canvas.addEventListener('mousemove', e => {
-    const rect = canvas.getBoundingClientRect();
-    mouse.x = e.clientX - rect.left;
-    mouse.y = e.clientY - rect.top;
-});
-
-canvas.addEventListener('mousedown', e => {
-    AudioEngine.init();
-    if (gameState === 'MENU' || gameState === 'GAMEOVER') {
-        resetGame();
-        gameState = 'PLAYING';
-    } else if (gameState === 'PLAYING') {
-        mouse.down = true;
-    }
-});
-
-canvas.addEventListener('mouseup', e => { mouse.down = false; });
-
-function resetGame() {
-    score = 0;
-    wave = 1;
-    lives = INIT_LIVES;
-    lasers = [];
-    enemies = [];
-    particles = [];
-    powerups = [];
-    player.x = canvas.width / 2;
-    player.y = canvas.height - 80;
-    player.shield = false;
-    player.shieldTimer = 0;
-    player.multishot = false;
-    player.multishotTimer = 0;
-}
-
-function spawnParticles(x, y, color, count=15) {
-    for(let i=0; i<count; i++) {
-        const angle = Math.random() * Math.PI * 2;
-        const speed = Math.random() * 4 + 1;
-        particles.push({
-            x: x, y: y,
-            vx: Math.cos(angle) * speed,
-            vy: Math.sin(angle) * speed,
-            alpha: 1.0,
-            decay: Math.random() * 0.03 + 0.02,
-            color: color || '#00f3ff',
-            size: Math.random() * 3 + 1
-        });
-    }
-}
-
-function spawnEnemy() {
-    const types = ['drone', 'fighter', 'tank'];
-    const rand = Math.random();
-    let type = 'drone';
-    let hp = 1;
-    let color = '#ff007f';
-    let w = 30, h = 24;
-
-    if (wave >= 2 && rand > 0.6) {
-        type = 'fighter';
-        hp = 2;
-        color = '#ffe600';
-        w = 34; h = 28;
-    }
-    if (wave >= 3 && rand > 0.85) {
-        type = 'tank';
-        hp = 4;
-        color = '#9d00ff';
-        w = 44; h = 36;
+class DifficultyManager:
+    """Manages game parameters and multipliers based on difficulty."""
+    DIFFICULTIES = {
+        "Casual": {"enemy_speed": 1.0, "spawn_rate": 1.5, "score_multiplier": 1.0, "player_lives": 5},
+        "Standard": {"enemy_speed": 1.4, "spawn_rate": 1.0, "score_multiplier": 1.5, "player_lives": 3},
+        "Pro": {"enemy_speed": 1.9, "spawn_rate": 0.75, "score_multiplier": 2.0, "player_lives": 3},
+        "Impossible": {"enemy_speed": 2.5, "spawn_rate": 0.5, "score_multiplier": 3.0, "player_lives": 1}
     }
 
-    enemies.push({
-        x: Math.random() * (canvas.width - 60) + 30,
-        y: -40,
-        w: w,
-        h: h,
-        type: type,
-        hp: hp,
-        maxHp: hp,
-        speed: (Math.random() * 1.5 + 1.0) * DIFF_SPEED * (1 + wave * 0.05),
-        color: color,
-        shootTimer: Math.random() * 100
-    });
-}
+    @classmethod
+    def get_config(cls, name: str):
+        return cls.DIFFICULTIES.get(name, cls.DIFFICULTIES["Standard"])
 
-function spawnPowerup(x, y) {
-    if (Math.random() < 0.25) {
-        const type = Math.random() > 0.5 ? 'shield' : 'multishot';
-        powerups.push({
-            x: x, y: y,
-            w: 22, h: 22,
-            type: type,
-            speed: 2.0
-        });
-    }
-}
 
-// Main Loop
-let lastTime = performance.now();
+# ==========================================
+# HTML5 CANVAS GAME COMPONENT
+# ==========================================
 
-function gameLoop(now) {
-    const dt = Math.min((now - lastTime) / 1000, 0.1);
-    lastTime = now;
-
-    update(dt);
-    render();
-
-    requestAnimationFrame(gameLoop);
-}
-
-function update(dt) {
-    // Stars update
-    for(let s of stars) {
-        s.y += s.speed;
-        if (s.y > canvas.height) s.y = 0;
-    }
-
-    if (shakeTimer > 0) shakeTimer -= dt;
-
-    if (gameState !== 'PLAYING') return;
-
-    // Wave progression
-    if (score >= wave * 500) {
-        wave++;
-        AudioEngine.score();
-    }
-
-    // Player Movement (Keyboard & Mouse)
-    let moveX = 0;
-    if (keys['ArrowLeft'] || keys['KeyA']) moveX = -1;
-    if (keys['ArrowRight'] || keys['KeyD']) moveX = 1;
+def render_arcade_game(difficulty: str, sound_enabled: bool):
+    config = DifficultyManager.get_config(difficulty)
     
-    if (moveX !== 0) {
-        player.x += moveX * player.speed;
-    } else {
-        // Smooth mouse follow interpolation
-        player.x += (mouse.x - player.x) * 0.15;
-    }
+    html_code = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <style>
+            body { 
+                margin: 0; 
+                background: #060814; 
+                font-family: 'Courier New', Courier, monospace; 
+                color: #00f3ff; 
+                overflow: hidden;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                height: 100vh;
+            }
+            #game-container {
+                position: relative;
+                box-shadow: 0 0 30px rgba(0, 243, 255, 0.3);
+                border: 2px solid #00f3ff;
+                border-radius: 8px;
+                background: #0a0e1a;
+            }
+            canvas {
+                display: block;
+                background: radial-gradient(circle at center, #0f172a 0%, #060814 100%);
+            }
+            #hud {
+                position: absolute;
+                top: 10px;
+                left: 10px;
+                right: 10px;
+                display: flex;
+                justify-content: space-between;
+                pointer-events: none;
+                font-size: 14px;
+                font-weight: bold;
+                text-shadow: 0 0 8px #00f3ff;
+                z-index: 10;
+            }
+            .hud-item { background: rgba(6, 8, 20, 0.8); padding: 4px 10px; border: 1px solid rgba(0,243,255,0.4); border-radius: 4px; }
+        </style>
+    </head>
+    <body>
+        <div id="game-container">
+            <div id="hud">
+                <div class="hud-item" id="hud-score">SCORE: 0</div>
+                <div class="hud-item" id="hud-lives">LIVES: __LIVES__</div>
+                <div class="hud-item" id="hud-wave">WAVE: 1</div>
+                <div class="hud-item" id="hud-shield">SHIELD: OFF</div>
+            </div>
+            <canvas id="gameCanvas" width="800" height="550"></canvas>
+        </div>
 
-    // Boundary clamp
-    if (player.x < player.w/2) player.x = player.w/2;
-    if (player.x > canvas.width - player.w/2) player.x = canvas.width - player.w/2;
+        <script>
+            const canvas = document.getElementById('gameCanvas');
+            const ctx = canvas.getContext('2d');
 
-    // Timers
-    if (player.shield) {
-        player.shieldTimer -= dt;
-        if (player.shieldTimer <= 0) player.shield = false;
-    }
-    if (player.multishot) {
-        player.multishotTimer -= dt;
-        if (player.multishotTimer <= 0) player.multishot = false;
-    }
+            // Config from Python
+            const DIFF_NAME = "__DIFF_NAME__";
+            const ENEMY_SPEED_MULT = __ENEMY_SPEED__;
+            const SPAWN_RATE_MULT = __SPAWN_RATE__;
+            const SCORE_MULT = __SCORE_MULT__;
+            const INITIAL_LIVES = __LIVES__;
 
-    // Shooting
-    if (player.cooldown > 0) player.cooldown -= dt;
-    if ((keys['Space'] || mouse.down) && player.cooldown <= 0) {
-        AudioEngine.laser();
-        if (player.multishot) {
-            lasers.push({ x: player.x, y: player.y - 15, vx: 0, vy: -12, color: '#00ff66' });
-            lasers.push({ x: player.x - 12, y: player.y - 10, vx: -2, vy: -11, color: '#00ff66' });
-            lasers.push({ x: player.x + 12, y: player.y - 10, vx: 2, vy: -11, color: '#00ff66' });
-        } else {
-            lasers.push({ x: player.x, y: player.y - 15, vx: 0, vy: -12, color: '#00f3ff' });
-        }
-        player.cooldown = 0.15;
-    }
+            // Web Audio Synthesizer
+            const AudioEngine = {
+                ctx: null,
+                muted: __MUTED__,
+                init() {
+                    if (!this.ctx) {
+                        const AC = window.AudioContext || window.webkitAudioContext;
+                        if (AC) this.ctx = new AC();
+                    }
+                    if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
+                },
+                playTone(freq, type, duration, endFreq) {
+                    if (this.muted) return;
+                    try {
+                        this.init();
+                        if (!this.ctx) return;
+                        const osc = this.ctx.createOscillator();
+                        const gain = this.ctx.createGain();
+                        osc.type = type || 'sine';
+                        osc.frequency.setValueAtTime(freq, this.ctx.currentTime);
+                        if (endFreq) osc.frequency.exponentialRampToValueAtTime(endFreq, this.ctx.currentTime + duration);
+                        gain.gain.setValueAtTime(0.12, this.ctx.currentTime);
+                        gain.gain.exponentialRampToValueAtTime(0.001, this.ctx.currentTime + duration);
+                        osc.connect(gain);
+                        gain.connect(this.ctx.destination);
+                        osc.start();
+                        osc.stop(this.ctx.currentTime + duration);
+                    } catch(e) {}
+                },
+                hit() { this.playTone(420, 'square', 0.06, 200); },
+                score() { this.playTone(523, 'sine', 0.1); setTimeout(() => this.playTone(659, 'sine', 0.15), 80); },
+                laser() { this.playTone(880, 'sawtooth', 0.06, 220); },
+                explode() { this.playTone(180, 'triangle', 0.25, 40); },
+                powerup() { this.playTone(440, 'sine', 0.1); setTimeout(() => this.playTone(880, 'sine', 0.2), 100); },
+                gameOver() { this.playTone(330, 'sawtooth', 0.3, 110); }
+            };
 
-    // Update lasers
-    for (let i = lasers.length - 1; i >= 0; i--) {
-        let l = lasers[i];
-        l.x += l.vx;
-        l.y += l.vy;
-        if (l.y < -10 || l.x < 0 || l.x > canvas.width) {
-            lasers.splice(i, 1);
-        }
-    }
+            // Game State
+            let gameState = 'START'; // START, PLAYING, PAUSED, GAMEOVER
+            let score = 0;
+            let lives = INITIAL_LIVES;
+            let wave = 1;
+            let highscore = 0;
+            let screenShakeTimer = 0;
+            let screenShakeIntensity = 0;
 
-    // Enemy Spawning
-    if (Math.random() < SPAWN_RATE * (1 + wave * 0.1)) {
-        spawnEnemy();
-    }
+            // Player object
+            let player = {
+                x: canvas.width / 2,
+                y: canvas.height - 60,
+                width: 32,
+                height: 32,
+                speed: 360,
+                dx: 0,
+                dy: 0,
+                shield: false,
+                shieldTimer: 0,
+                multishot: false,
+                multishotTimer: 0,
+                color: '#00f3ff'
+            };
 
-    // Update enemies
-    for (let i = enemies.length - 1; i >= 0; i--) {
-        let e = enemies[i];
-        e.y += e.speed;
+            let keys = {};
+            let bullets = [];
+            let enemies = [];
+            let particles = [];
+            let powerups = [];
+            let stardust = [];
 
-        // Enemy collision with player
-        const dx = e.x - player.x;
-        const dy = e.y - player.y;
-        const dist = Math.sqrt(dx*dx + dy*dy);
-        if (dist < (e.w/2 + player.w/2)) {
-            AudioEngine.explode();
-            shakeTimer = 0.3;
-            spawnParticles(player.x, player.y, '#ff007f', 25);
-            enemies.splice(i, 1);
-            if (player.shield) {
+            // Init Stardust
+            for (let i = 0; i < 70; i++) {
+                stardust.push({
+                    x: Math.random() * canvas.width,
+                    y: Math.random() * canvas.height,
+                    size: Math.random() * 2 + 0.5,
+                    speed: Math.random() * 30 + 10,
+                    alpha: Math.random() * 0.7 + 0.3
+                });
+            }
+
+            // Controls
+            window.addEventListener('keydown', e => {
+                AudioEngine.init();
+                if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) {
+                    e.preventDefault();
+                }
+                keys[e.key] = true;
+                if ((e.key === ' ' || e.key === 'Enter') && (gameState === 'START' || gameState === 'GAMEOVER')) {
+                    startGame();
+                }
+                if (e.key === 'p' || e.key === 'P') {
+                    if (gameState === 'PLAYING') gameState = 'PAUSED';
+                    else if (gameState === 'PAUSED') gameState = 'PLAYING';
+                }
+            });
+
+            window.addEventListener('keyup', e => {
+                keys[e.key] = false;
+            });
+
+            canvas.addEventListener('mousemove', e => {
+                AudioEngine.init();
+                const rect = canvas.getBoundingClientRect();
+                const mouseX = e.clientX - rect.left;
+                const mouseY = e.clientY - rect.top;
+                if (gameState === 'PLAYING') {
+                    player.x += (mouseX - player.x) * 0.2;
+                    player.y += (mouseY - player.y) * 0.2;
+                }
+            });
+
+            canvas.addEventListener('click', () => {
+                AudioEngine.init();
+                if (gameState === 'START' || gameState === 'GAMEOVER') {
+                    startGame();
+                } else if (gameState === 'PLAYING') {
+                    fireLaser();
+                }
+            });
+
+            let lastSpawnTime = 0;
+            let spawnInterval = 1.8 / SPAWN_RATE_MULT;
+            let lastLaserTime = 0;
+
+            function startGame() {
+                score = 0;
+                lives = INITIAL_LIVES;
+                wave = 1;
+                enemies = [];
+                bullets = [];
+                particles = [];
+                powerups = [];
+                player.x = canvas.width / 2;
+                player.y = canvas.height - 60;
                 player.shield = false;
-            } else {
-                lives--;
-                if (lives <= 0) {
-                    AudioEngine.gameOver();
-                    gameState = 'GAMEOVER';
+                player.multishot = false;
+                gameState = 'PLAYING';
+            }
+
+            function triggerShake(intensity, duration) {
+                screenShakeIntensity = intensity;
+                screenShakeTimer = duration;
+            }
+
+            function spawnParticle(x, y, color, count = 12, speed = 120) {
+                for (let i = 0; i < count; i++) {
+                    const angle = Math.random() * Math.PI * 2;
+                    const spd = Math.random() * speed + 20;
+                    particles.push({
+                        x: x,
+                        y: y,
+                        vx: Math.cos(angle) * spd,
+                        vy: Math.sin(angle) * spd,
+                        color: color,
+                        alpha: 1.0,
+                        life: Math.random() * 0.6 + 0.3,
+                        size: Math.random() * 3 + 1
+                    });
                 }
             }
-            continue;
-        }
 
-        // Out of bounds
-        if (e.y > canvas.height + 50) {
-            enemies.splice(i, 1);
-            continue;
-        }
+            function fireLaser() {
+                const now = performance.now() / 1000;
+                if (now - lastLaserTime < 0.15) return;
+                lastLaserTime = now;
+                AudioEngine.laser();
 
-        // Laser vs Enemy collision
-        for (let j = lasers.length - 1; j >= 0; j--) {
-            let l = lasers[j];
-            const ldx = l.x - e.x;
-            const ldy = l.y - e.y;
-            if (Math.abs(ldx) < e.w/2 + 4 && Math.abs(ldy) < e.h/2 + 4) {
-                e.hp--;
-                lasers.splice(j, 1);
-                spawnParticles(l.x, l.y, e.color, 6);
-                AudioEngine.hit();
-
-                if (e.hp <= 0) {
-                    AudioEngine.explode();
-                    spawnParticles(e.x, e.y, e.color, 20);
-                    score += Math.floor(100 * SCORE_MULT * (e.maxHp));
-                    spawnPowerup(e.x, e.y);
-                    enemies.splice(i, 1);
+                if (player.multishot) {
+                    bullets.push({x: player.x - 12, y: player.y - 15, vx: 0, vy: -650, color: '#ffe600'});
+                    bullets.push({x: player.x, y: player.y - 20, vx: 0, vy: -700, color: '#00f3ff'});
+                    bullets.push({x: player.x + 12, y: player.y - 15, vx: 0, vy: -650, color: '#ffe600'});
+                } else {
+                    bullets.push({x: player.x, y: player.y - 18, vx: 0, vy: -700, color: '#00f3ff'});
                 }
-                break;
             }
-        }
-    }
 
-    // Update powerups
-    for (let i = powerups.length - 1; i >= 0; i--) {
-        let p = powerups[i];
-        p.y += p.speed;
-        const pdx = p.x - player.x;
-        const pdy = p.y - player.y;
-        if (Math.abs(pdx) < 25 && Math.abs(pdy) < 25) {
-            AudioEngine.powerup();
-            if (p.type === 'shield') {
-                player.shield = true;
-                player.shieldTimer = 8.0;
-            } else {
-                player.multishot = true;
-                player.multishotTimer = 8.0;
+            let lastTime = performance.now();
+
+            function gameLoop(now) {
+                const dt = Math.min((now - lastTime) / 1000, 0.1);
+                lastTime = now;
+
+                update(dt);
+                render();
+
+                requestAnimationFrame(gameLoop);
             }
-            powerups.splice(i, 1);
-            continue;
-        }
-        if (p.y > canvas.height + 30) {
-            powerups.splice(i, 1);
-        }
-    }
 
-    // Update particles
-    for (let i = particles.length - 1; i >= 0; i--) {
-        let p = particles[i];
-        p.x += p.vx;
-        p.y += p.vy;
-        p.alpha -= p.decay;
-        if (p.alpha <= 0) particles.splice(i, 1);
-    }
+            function update(dt) {
+                // Stardust update
+                stardust.forEach(s => {
+                    s.y += s.speed * dt;
+                    if (s.y > canvas.height) {
+                        s.y = 0;
+                        s.x = Math.random() * canvas.width;
+                    }
+                });
 
-    // HUD DOM update
-    document.getElementById('lbl-score').innerText = score;
-    document.getElementById('lbl-wave').innerText = wave;
-    document.getElementById('lbl-lives').innerText = lives;
-    document.getElementById('lbl-shield').innerText = player.shield ? Math.ceil(player.shieldTimer) + 's' : (player.multishot ? 'MULTI' : 'OFF');
-}
+                if (gameState !== 'PLAYING') return;
 
-function render() {
-    ctx.save();
-    // Camera shake
-    if (shakeTimer > 0) {
-        const offsetX = (Math.random() - 0.5) * 10;
-        const offsetY = (Math.random() - 0.5) * 10;
-        ctx.translate(offsetX, offsetY);
-    }
+                // Screen shake countdown
+                if (screenShakeTimer > 0) {
+                    screenShakeTimer -= dt;
+                }
 
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                // Powerup timers
+                if (player.shield) {
+                    player.shieldTimer -= dt;
+                    if (player.shieldTimer <= 0) player.shield = false;
+                }
+                if (player.multishot) {
+                    player.multishotTimer -= dt;
+                    if (player.multishotTimer <= 0) player.multishot = false;
+                }
 
-    // Draw Stars
-    ctx.fillStyle = '#ffffff';
-    for(let s of stars) {
-        ctx.globalAlpha = s.speed / 2;
-        ctx.fillRect(s.x, s.y, s.size, s.size);
-    }
-    ctx.globalAlpha = 1.0;
+                // Player Keyboard Movement
+                let moveX = 0;
+                let moveY = 0;
+                if (keys['ArrowLeft'] || keys['a'] || keys['A']) moveX -= 1;
+                if (keys['ArrowRight'] || keys['d'] || keys['D']) moveX += 1;
+                if (keys['ArrowUp'] || keys['w'] || keys['W']) moveY -= 1;
+                if (keys['ArrowDown'] || keys['s'] || keys['S']) moveY += 1;
 
-    // Draw Particles
-    for(let p of particles) {
-        ctx.save();
-        ctx.globalAlpha = p.alpha;
-        ctx.shadowBlur = 8;
-        ctx.shadowColor = p.color;
-        ctx.fillStyle = p.color;
-        ctx.fillRect(p.x, p.y, p.size, p.size);
-        ctx.restore();
-    }
+                if (moveX !== 0 && moveY !== 0) {
+                    moveX *= 0.7071;
+                    moveY *= 0.7071;
+                }
 
-    // Draw Powerups
-    for(let p of powerups) {
-        ctx.save();
-        ctx.shadowBlur = 12;
-        ctx.shadowColor = p.type === 'shield' ? '#00f3ff' : '#00ff66';
-        ctx.fillStyle = p.type === 'shield' ? '#00f3ff' : '#00ff66';
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, 11, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.fillStyle = '#060814';
-        ctx.font = 'bold 10px Courier New';
-        ctx.fillText(p.type === 'shield' ? 'S' : 'M', p.x - 3, p.y + 4);
-        ctx.restore();
-    }
+                player.x += moveX * player.speed * dt;
+                player.y += moveY * player.speed * dt;
 
-    // Draw Lasers
-    for(let l of lasers) {
-        ctx.save();
-        ctx.shadowBlur = 12;
-        ctx.shadowColor = l.color;
-        ctx.fillStyle = l.color;
-        ctx.fillRect(l.x - 2, l.y - 8, 4, 16);
-        ctx.restore();
-    }
+                // Bounds
+                player.x = Math.max(20, Math.min(canvas.width - 20, player.x));
+                player.y = Math.max(30, Math.min(canvas.height - 30, player.y));
 
-    // Draw Enemies
-    for(let e of enemies) {
-        ctx.save();
-        ctx.shadowBlur = 14;
-        ctx.shadowColor = e.color;
-        ctx.strokeStyle = e.color;
-        ctx.lineWidth = 2;
-        ctx.fillStyle = '#060814';
+                // Auto fire spacebar
+                if (keys[' ']) {
+                    fireLaser();
+                }
 
-        ctx.beginPath();
-        ctx.moveTo(e.x, e.y + e.h/2);
-        ctx.lineTo(e.x - e.w/2, e.y - e.h/2);
-        ctx.lineTo(e.x, e.y - e.h/4);
-        ctx.lineTo(e.x + e.w/2, e.y - e.h/2);
-        ctx.closePath();
-        ctx.fill();
-        ctx.stroke();
-        ctx.restore();
-    }
+                // Enemy Spawning
+                lastSpawnTime += dt;
+                if (lastSpawnTime >= spawnInterval) {
+                    lastSpawnTime = 0;
+                    spawnEnemy();
+                }
 
-    // Draw Player
-    if (gameState === 'PLAYING' || gameState === 'PAUSED') {
-        ctx.save();
-        ctx.shadowBlur = 15;
-        ctx.shadowColor = '#00f3ff';
-        ctx.strokeStyle = '#00f3ff';
-        ctx.lineWidth = 2;
-        ctx.fillStyle = '#060814';
+                // Update Bullets
+                for (let i = bullets.length - 1; i >= 0; i--) {
+                    let b = bullets[i];
+                    b.x += (b.vx || 0) * dt;
+                    b.y += b.vy * dt;
+                    if (b.y < -20 || b.y > canvas.height + 20 || b.x < -20 || b.x > canvas.width + 20) {
+                        bullets.splice(i, 1);
+                    }
+                }
 
-        ctx.beginPath();
-        ctx.moveTo(player.x, player.y - player.h/2);
-        ctx.lineTo(player.x - player.w/2, player.y + player.h/2);
-        ctx.lineTo(player.x, player.y + player.h/3);
-        ctx.lineTo(player.x + player.w/2, player.y + player.h/2);
-        ctx.closePath();
-        ctx.fill();
-        ctx.stroke();
+                // Update Enemies
+                for (let i = enemies.length - 1; i >= 0; i--) {
+                    let e = enemies[i];
+                    e.y += e.vy * dt;
+                    if (e.behavior === 'zigzag') {
+                        e.x += Math.sin(e.y * 0.03) * 3;
+                    }
 
-        if (player.shield) {
-            ctx.strokeStyle = '#00f3ff';
-            ctx.shadowColor = '#00f3ff';
-            ctx.beginPath();
-            ctx.arc(player.x, player.y, player.w, 0, Math.PI * 2);
-            ctx.stroke();
-        }
-        ctx.restore();
-    }
+                    // Check collision with player
+                    const dist = Math.hypot(player.x - e.x, player.y - e.y);
+                    if (dist < 26) {
+                        if (player.shield) {
+                            player.shield = false;
+                            spawnParticle(e.x, e.y, '#00f3ff', 20, 150);
+                            AudioEngine.explode();
+                            enemies.splice(i, 1);
+                        } else {
+                            lives--;
+                            AudioEngine.hit();
+                            triggerShake(8, 0.3);
+                            spawnParticle(player.x, player.y, '#ff007f', 25, 180);
+                            enemies.splice(i, 1);
+                            if (lives <= 0) {
+                                gameState = 'GAMEOVER';
+                                AudioEngine.gameOver();
+                            }
+                        }
+                        continue;
+                    }
 
-    // UI Overlays in Canvas
-    if (gameState === 'MENU') {
-        ctx.fillStyle = 'rgba(6, 8, 20, 0.85)';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
+                    // Check collision with bullets
+                    let enemyDestroyed = false;
+                    for (let j = bullets.length - 1; j >= 0; j--) {
+                        let b = bullets[j];
+                        const bDist = Math.hypot(b.x - e.x, b.y - e.y);
+                        if (bDist < e.radius + 8) {
+                            bullets.splice(j, 1);
+                            e.hp--;
+                            if (e.hp <= 0) {
+                                enemyDestroyed = true;
+                            }
+                            break;
+                        }
+                    }
 
-        ctx.shadowBlur = 20;
-        ctx.shadowColor = '#00f3ff';
-        ctx.fillStyle = '#00f3ff';
-        ctx.font = 'bold 36px Courier New';
-        ctx.textAlign = 'center';
-        ctx.fillText('GALAXY SPACE SHOOTER', canvas.width/2, canvas.height/2 - 50);
+                    if (enemyDestroyed) {
+                        AudioEngine.explode();
+                        spawnParticle(e.x, e.y, e.color, 16, 140);
+                        score += Math.floor(e.scoreVal * SCORE_MULT);
 
-        ctx.shadowBlur = 10;
-        ctx.shadowColor = '#ffe600';
-        ctx.fillStyle = '#ffe600';
-        ctx.font = '18px Courier New';
-        ctx.fillText('CLICK OR PRESS SPACE TO START', canvas.width/2, canvas.height/2 + 10);
+                        // Chance to drop powerup
+                        if (Math.random() < 0.18) {
+                            const type = Math.random() < 0.5 ? 'shield' : 'multishot';
+                            powerups.push({x: e.x, y: e.y, type: type, radius: 14, vy: 70});
+                        }
 
-        ctx.fillStyle = '#00ff66';
-        ctx.font = '14px Courier New';
-        ctx.fillText('Controls: Arrow Keys / WASD / Mouse to Move | Space / Click to Shoot | P to Pause', canvas.width/2, canvas.height/2 + 60);
-        ctx.textAlign = 'left';
-    } else if (gameState === 'PAUSED') {
-        ctx.fillStyle = 'rgba(6, 8, 20, 0.7)';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
+                        enemies.splice(i, 1);
 
-        ctx.shadowBlur = 20;
-        ctx.shadowColor = '#ffe600';
-        ctx.fillStyle = '#ffe600';
-        ctx.font = 'bold 32px Courier New';
-        ctx.textAlign = 'center';
-        ctx.fillText('GAME PAUSED', canvas.width/2, canvas.height/2);
-        ctx.font = '16px Courier New';
-        ctx.fillText('Press P to Resume', canvas.width/2, canvas.height/2 + 40);
-        ctx.textAlign = 'left';
-    } else if (gameState === 'GAMEOVER') {
-        ctx.fillStyle = 'rgba(6, 8, 20, 0.85)';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
+                        // Wave progress
+                        if (score >= wave * 500) {
+                            wave++;
+                            spawnInterval = Math.max(0.4, spawnInterval * 0.9);
+                            AudioEngine.score();
+                        }
+                        continue;
+                    }
 
-        ctx.shadowBlur = 25;
-        ctx.shadowColor = '#ff007f';
-        ctx.fillStyle = '#ff007f';
-        ctx.font = 'bold 40px Courier New';
-        ctx.textAlign = 'center';
-        ctx.fillText('GAME OVER', canvas.width/2, canvas.height/2 - 60);
+                    if (e.y > canvas.height + 40) {
+                        enemies.splice(i, 1);
+                    }
+                }
 
-        ctx.shadowBlur = 15;
-        ctx.shadowColor = '#00f3ff';
-        ctx.fillStyle = '#00f3ff';
-        ctx.font = '22px Courier New';
-        ctx.fillText('FINAL SCORE: ' + score, canvas.width/2, canvas.height/2 - 10);
+                // Update Powerups
+                for (let i = powerups.length - 1; i >= 0; i--) {
+                    let p = powerups[i];
+                    p.y += p.vy * dt;
+                    const pDist = Math.hypot(player.x - p.x, player.y - p.y);
+                    if (pDist < 28) {
+                        AudioEngine.powerup();
+                        spawnParticle(p.x, p.y, p.type === 'shield' ? '#00f3ff' : '#ffe600', 15, 100);
+                        if (p.type === 'shield') {
+                            player.shield = true;
+                            player.shieldTimer = 10.0;
+                        } else {
+                            player.multishot = true;
+                            player.multishotTimer = 8.0;
+                        }
+                        powerups.splice(i, 1);
+                        continue;
+                    }
+                    if (p.y > canvas.height + 30) {
+                        powerups.splice(i, 1);
+                    }
+                }
 
-        ctx.fillStyle = '#ffe600';
-        ctx.font = '16px Courier New';
-        ctx.fillText('SUBMIT YOUR SCORE BELOW!', canvas.width/2, canvas.height/2 + 35);
-        ctx.fillText('CLICK OR PRESS SPACE TO RESTART', canvas.width/2, canvas.height/2 + 75);
-        ctx.textAlign = 'left';
-    }
+                // Update Particles
+                for (let i = particles.length - 1; i >= 0; i--) {
+                    let pt = particles[i];
+                    pt.x += pt.vx * dt;
+                    pt.y += pt.vy * dt;
+                    pt.alpha -= dt / pt.life;
+                    if (pt.alpha <= 0) {
+                        particles.splice(i, 1);
+                    }
+                }
 
-    ctx.restore();
-}
+                // HUD updates
+                document.getElementById('hud-score').innerText = "SCORE: " + score;
+                document.getElementById('hud-lives').innerText = "LIVES: " + '❤️'.repeat(Math.max(0, lives));
+                document.getElementById('hud-wave').innerText = "WAVE: " + wave;
+                const shieldStatus = player.shield ? "SHIELD (" + Math.ceil(player.shieldTimer) + "s)" : (player.multishot ? "MULTISHOT (" + Math.ceil(player.multishotTimer) + "s)" : "OFF");
+                document.getElementById('hud-shield').innerText = "PWR: " + shieldStatus;
+            }
 
-requestAnimationFrame(gameLoop);
-</script>
-</body>
-</html>
-"""
+            function spawnEnemy() {
+                const types = [
+                    {color: '#ff007f', radius: 16, vy: (120 + wave * 15) * ENEMY_SPEED_MULT, hp: 1, scoreVal: 20, behavior: 'straight'},
+                    {color: '#9d00ff', radius: 20, vy: (90 + wave * 10) * ENEMY_SPEED_MULT, hp: 2, scoreVal: 40, behavior: 'zigzag'},
+                    {color: '#ffe600', radius: 24, vy: (70 + wave * 8) * ENEMY_SPEED_MULT, hp: 3, scoreVal: 70, behavior: 'straight'}
+                ];
+                const type = types[Math.floor(Math.random() * types.length)];
+                enemies.push({
+                    x: Math.random() * (canvas.width - 60) + 30,
+                    y: -30,
+                    radius: type.radius,
+                    vy: type.vy,
+                    hp: type.hp,
+                    color: type.color,
+                    scoreVal: type.scoreVal,
+                    behavior: type.behavior
+                });
+            }
+
+            function render() {
+                ctx.save();
+                if (screenShakeTimer > 0) {
+                    const shakeX = (Math.random() - 0.5) * screenShakeIntensity;
+                    const shakeY = (Math.random() - 0.5) * screenShakeIntensity;
+                    ctx.translate(shakeX, shakeY);
+                }
+
+                // Clear background
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+                // Draw Stardust
+                stardust.forEach(s => {
+                    ctx.fillStyle = 'rgba(255, 255, 255, ' + s.alpha + ')';
+                    ctx.fillRect(s.x, s.y, s.size, s.size);
+                });
+
+                // Draw Particles
+                particles.forEach(pt => {
+                    ctx.save();
+                    ctx.globalAlpha = Math.max(0, pt.alpha);
+                    ctx.shadowBlur = 8;
+                    ctx.shadowColor = pt.color;
+                    ctx.fillStyle = pt.color;
+                    ctx.fillRect(pt.x, pt.y, pt.size, pt.size);
+                    ctx.restore();
+                });
+
+                // Draw Powerups
+                powerups.forEach(p => {
+                    ctx.save();
+                    ctx.shadowBlur = 12;
+                    ctx.shadowColor = p.type === 'shield' ? '#00f3ff' : '#ffe600';
+                    ctx.fillStyle = p.type === 'shield' ? '#00f3ff' : '#ffe600';
+                    ctx.beginPath();
+                    ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+                    ctx.fill();
+                    ctx.fillStyle = '#060814';
+                    ctx.font = 'bold 12px Courier New';
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText(p.type === 'shield' ? 'S' : 'M', p.x, p.y);
+                    ctx.restore();
+                });
+
+                // Draw Bullets
+                bullets.forEach(b => {
+                    ctx.save();
+                    ctx.shadowBlur = 10;
+                    ctx.shadowColor = b.color;
+                    ctx.fillStyle = b.color;
+                    ctx.fillRect(b.x - 2, b.y - 6, 4, 12);
+                    ctx.restore();
+                });
+
+                // Draw Enemies
+                enemies.forEach(e => {
+                    ctx.save();
+                    ctx.shadowBlur = 14;
+                    ctx.shadowColor = e.color;
+                    ctx.strokeStyle = e.color;
+                    ctx.lineWidth = 2;
+                    ctx.fillStyle = '#060814';
+
+                    ctx.beginPath();
+                    ctx.moveTo(e.x, e.y + e.radius);
+                    ctx.lineTo(e.x - e.radius, e.y - e.radius);
+                    ctx.lineTo(e.x, e.y - e.radius * 0.5);
+                    ctx.lineTo(e.x + e.radius, e.y - e.radius);
+                    ctx.closePath();
+                    ctx.fill();
+                    ctx.stroke();
+                    ctx.restore();
+                });
+
+                // Draw Player Ship
+                if (gameState === 'PLAYING' || gameState === 'PAUSED') {
+                    ctx.save();
+                    ctx.shadowBlur = 16;
+                    ctx.shadowColor = player.color;
+                    ctx.strokeStyle = player.color;
+                    ctx.lineWidth = 2;
+                    ctx.fillStyle = '#060814';
+
+                    // Ship vector triangle
+                    ctx.beginPath();
+                    ctx.moveTo(player.x, player.y - 20);
+                    ctx.lineTo(player.x - 16, player.y + 16);
+                    ctx.lineTo(player.x, player.y + 8);
+                    ctx.lineTo(player.x + 16, player.y + 16);
+                    ctx.closePath();
+                    ctx.fill();
+                    ctx.stroke();
+
+                    // Engine thruster flame
+                    ctx.fillStyle = '#ff007f';
+                    ctx.beginPath();
+                    ctx.moveTo(player.x - 6, player.y + 16);
+                    ctx.lineTo(player.x, player.y + 26 + Math.random() * 6);
+                    ctx.lineTo(player.x + 6, player.y + 16);
+                    ctx.fill();
+
+                    // Shield bubble
+                    if (player.shield) {
+                        ctx.strokeStyle = '#00f3ff';
+                        ctx.lineWidth = 2;
+                        ctx.shadowBlur = 20;
+                        ctx.shadowColor = '#00f3ff';
+                        ctx.beginPath();
+                        ctx.arc(player.x, player.y, 28, 0, Math.PI * 2);
+                        ctx.stroke();
+                    }
+
+                    ctx.restore();
+                }
+
+                // Overlays
+                if (gameState === 'START') {
+                    ctx.fillStyle = 'rgba(6, 8, 20, 0.85)';
+                    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                    ctx.shadowBlur = 20;
+                    ctx.shadowColor = '#00f3ff';
+                    ctx.fillStyle = '#00f3ff';
+                    ctx.font = 'bold 36px Courier New';
+                    ctx.textAlign = 'center';
+                    ctx.fillText('GALAXY SPACE SHOOTER', canvas.width / 2, canvas.height / 2 - 50);
+
+                    ctx.shadowBlur = 10;
+                    ctx.shadowColor = '#ffe600';
+                    ctx.fillStyle = '#ffe600';
+                    ctx.font = '18px Courier New';
+                    ctx.fillText('PRESS SPACEBAR OR CLICK TO START', canvas.width / 2, canvas.height / 2 + 10);
+
+                    ctx.fillStyle = '#a0aec0';
+                    ctx.font = '14px Courier New';
+                    ctx.fillText('Move: WASD / Arrows / Mouse | Shoot: Space / Click | Pause: P', canvas.width / 2, canvas.height / 2 + 60);
+                } else if (gameState === 'PAUSED') {
+                    ctx.fillStyle = 'rgba(6, 8, 20, 0.7)';
+                    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                    ctx.shadowBlur = 15;
+                    ctx.shadowColor = '#ffe600';
+                    ctx.fillStyle = '#ffe600';
+                    ctx.font = 'bold 32px Courier New';
+                    ctx.textAlign = 'center';
+                    ctx.fillText('GAME PAUSED', canvas.width / 2, canvas.height / 2);
+                    ctx.font = '16px Courier New';
+                    ctx.fillStyle = '#00f3ff';
+                    ctx.fillText('Press P to Resume', canvas.width / 2, canvas.height / 2 + 40);
+                } else if (gameState === 'GAMEOVER') {
+                    ctx.fillStyle = 'rgba(6, 8, 20, 0.9)';
+                    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                    ctx.shadowBlur = 20;
+                    ctx.shadowColor = '#ff007f';
+                    ctx.fillStyle = '#ff007f';
+                    ctx.font = 'bold 40px Courier New';
+                    ctx.textAlign = 'center';
+                    ctx.fillText('GAME OVER', canvas.width / 2, canvas.height / 2 - 50);
+
+                    ctx.shadowBlur = 12;
+                    ctx.shadowColor = '#00f3ff';
+                    ctx.fillStyle = '#00f3ff';
+                    ctx.font = '22px Courier New';
+                    ctx.fillText('FINAL SCORE: ' + score, canvas.width / 2, canvas.height / 2 + 5);
+
+                    ctx.fillStyle = '#ffe600';
+                    ctx.font = '16px Courier New';
+                    ctx.fillText('PRESS SPACEBAR TO PLAY AGAIN & SUBMIT SCORE', canvas.width / 2, canvas.height / 2 + 55);
+                }
+
+                ctx.restore();
+            }
+
+            requestAnimationFrame(gameLoop);
+        </script>
+    </body>
+    </html>
+    """
 
     # Inject dynamic configuration values securely
-    html_template = html_template.replace("__SPEED_MULT__", str(settings["speed_mult"]))
-    html_template = html_template.replace("__SPAWN_RATE__", str(settings["enemy_spawn_rate"]))
-    html_template = html_template.replace("__SCORE_MULT__", str(settings["score_mult"]))
-    html_template = html_template.replace("__LIVES__", str(settings["player_lives"]))
-    return html_template
+    html_code = html_code.replace("__DIFF_NAME__", difficulty \
+        ).replace("__ENEMY_SPEED__", str(config["enemy_speed"]) \
+        ).replace("__SPAWN_RATE__", str(config["spawn_rate"]) \
+        ).replace("__SCORE_MULT__", str(config["score_multiplier"]) \
+        ).replace("__LIVES__", str(config["player_lives"]) \
+        ).replace("__MUTED__", "true" if not sound_enabled else "false")
+
+    components.html(html_code, height=600)
+
+
+# ==========================================
+# STREAMLIT UI APPLICATION
+# ==========================================
 
 def main():
     st.set_page_config(
         page_title="Galaxy Space Shooter Arcade",
         page_icon="🚀",
-        layout="wide"
-    );
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
 
-    st.title("🚀 GALAXY SPACE SHOOTER ARCADE")
-    st.markdown("Retro glowing vector arcade shooter with procedural Web Audio, power-up shields & multishot, and persistent SQLite leaderboards.")
+    db = LeaderboardDB()
 
-    # Sidebar controls & stats
-    with st.sidebar:
-        st.header("⚙️ Game Control Panel")
-        difficulty = st.selectbox("Select Difficulty", ["Casual", "Standard", "Pro", "Impossible"], index=1)
-        
-        st.divider()
-        st.subheader("📊 Leaderboard Stats")
-        stats = db.get_stats()
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Total Games", stats["total_games"])
-            st.metric("High Score", stats["high_score"])
-        with col2:
-            st.metric("Avg Score", stats["avg_score"])
+    # Custom Styling
+    st.markdown("""
+        <style>
+            .main-title { font-size: 2.5rem; color: #00f3ff; text-shadow: 0 0 12px rgba(0,243,255,0.6); font-family: 'Courier New', monospace; font-weight: bold; }
+            .sub-header { color: #ffe600; font-family: 'Courier New', monospace; }
+            .stAlert { background-color: #0a0e1a; color: #00f3ff; border: 1px solid #00f3ff; }
+        </style>
+    """, unsafe_allow_html=True)
 
-        st.divider()
-        with st.expander("🛠️ Database Management"):
-            if st.button("⚠️ Reset Leaderboard", type="secondary"):
-                db.reset_leaderboard()
-                st.success("Leaderboard wiped successfully!")
+    # Sidebar Controls
+    st.sidebar.markdown("### 🕹️ ARCADE CONFIG")
+    difficulty = st.sidebar.selectbox("Select Difficulty", ["Casual", "Standard", "Pro", "Impossible"], index=1)
+    sound_enabled = st.sidebar.toggle("🔊 Audio Synthesizer", value=True)
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🏆 HIGH SCORE SUBMISSION")
+    with st.sidebar.form("score_form"):
+        player_name = st.text_input("Pilot CallSign", value="", max_chars=20)
+        final_score = st.number_input("Recorded Score", min_value=0, max_value=999999, value=0, step=100)
+        submitted = st.form_submit_button("Transmit Score")
+        if submitted:
+            if player_name.strip():
+                db.add_score(player_name, final_score, difficulty)
+                st.sidebar.success(f"Score transmitted for {player_name}!")
                 st.rerun()
+            else:
+                st.sidebar.error("Please enter a pilot callsign.")
 
-    # Layout: Game Canvas on left, High Score Submission & Leaderboard on right
-    col_game, col_board = st.columns([2.1, 1])
+    st.sidebar.markdown("---")
+    with st.sidebar.expander("🛠️ Database Management"):
+        if st.button("Reset All Leaderboard Data", type="primary"):
+            db.reset_database()
+            st.sidebar.success("Leaderboard wiped clean!")
+            st.rerun()
 
-    with col_game:
-        st.subheader(f"🎮 Active Sector ({difficulty} Mode)")
-        arcade_html = get_arcade_html(difficulty)
-        components.html(arcade_html, height=660)
+    # Main Header
+    st.markdown('<div class="main-title">🚀 GALAXY SPACE SHOOTER ARCADE</div>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-header">Retro glowing vector combat, progressive waves, power-up shields, and procedural sound synth.</p>', unsafe_allow_html=True)
 
-    with col_board:
-        st.subheader("🏆 Submit Score")
-        with st.form("score_form", clear_on_submit=True):
-            player_name = st.text_input("Pilot Call Sign", max_chars=20, placeholder="ACE_PILOT")
-            final_score = st.number_input("Final Score Achieved", min_value=0, step=10, value=0)
-            sub_diff = st.selectbox("Recorded Difficulty", ["Casual", "Standard", "Pro", "Impossible"], index=1)
-            submit_btn = st.form_submit_button("Record to Database")
+    stats = db.get_stats()
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Global High Score", f"{stats['high_score']:,}", delta=difficulty)
+    col2.metric("Total Games Played", f"{stats['total_games']:,}")
+    col3.metric("Average Score", f"{stats['avg_score']:,}")
 
-            if submit_btn:
-                if db.add_score(player_name, final_score, sub_diff):
-                    st.success(f"Score {final_score} recorded for {player_name}!")
-                    st.rerun()
-                else:
-                    st.error("Please provide a valid pilot call sign.")
+    st.markdown("---")
 
-        st.divider()
-        st.subheader("🎖️ Top Aces Leaderboard")
-        top_scores = db.get_top_scores(10)
-        if top_scores:
-            formatted_data = []
-            for idx, (name, score, diff, date) in enumerate(top_scores, start=1):
-                formatted_data.append({
-                    "Rank": f"#{idx}",
-                    "Pilot": name,
-                    "Score": score,
-                    "Difficulty": diff,
-                    "Date": str(date)[:16]
-                })
-            st.dataframe(formatted_data, hide_index=True, use_container_width=True)
-        else:
-            st.info("No high scores recorded yet. Be the first ace!")
+    # Render Game Canvas
+    render_arcade_game(difficulty, sound_enabled)
+
+    st.markdown("---")
+
+    # Leaderboard Section
+    st.markdown("### 🏆 PILOT LEADERBOARD RANKINGS")
+    filter_diff = st.selectbox("Filter by Difficulty", ["All", "Casual", "Standard", "Pro", "Impossible"], key="filter_diff")
+    scores_data = db.get_top_scores(limit=10, difficulty=filter_diff)
+
+    if scores_data:
+        table_data = []
+        for rank, row in enumerate(scores_data, start=1):
+            table_data.append({
+                "Rank": rank,
+                "Pilot": row[0],
+                "Score": f"{row[1]:,}",
+                "Difficulty": row[2],
+                "Timestamp": row[3]
+            })
+        st.dataframe(table_data, use_container_width=True, hide_index=True)
+    else:
+        st.info(
+            "No high scores recorded yet for this filter. Complete a game and submit your score using the sidebar form!"
+        )
+
+    # Instructions expander
+    with st.expander("📖 Mission Briefing & Controls"):
+        st.markdown("""
+        - **Movement**: Use `WASD`, `Arrow Keys`, or trackpad/mouse movement to steer your vector fighter.
+        - **Weapons**: Press `Spacebar` or `Left Click` to fire plasma lasers.
+        - **Power-ups**: Collect glowing cyan (**S**hield) and yellow (**M**ultishot) power-up pods dropped by elite alien ships.
+        - **Pause**: Press `P` anytime during combat to take a breather.
+        - **Scoring**: Higher difficulties (`Pro`, `Impossible`) grant higher score multipliers!
+        """)
+
 
 if __name__ == '__main__':
     main()
