@@ -151,68 +151,70 @@ def get_pong_html(difficulty: str) -> str:
     ai_speed = ai_speeds.get(difficulty, 0.07)
     winning_score = 5
 
-    return f"""
+    raw_html = """
     <!DOCTYPE html>
     <html>
     <head>
+        <meta charset="utf-8">
         <style>
-            body {{
-                background-color: #0d1117;
-                color: #58a6ff;
+            * { box-sizing: border-box; user-select: none; }
+            body {
+                background: #060913;
+                color: #00f3ff;
                 font-family: 'Courier New', Courier, monospace;
                 text-align: center;
                 margin: 0;
-                padding: 0;
+                padding: 10px 0;
                 overflow: hidden;
-            }}
-            #game-container {{
+            }
+            #game-container {
                 display: flex;
                 flex-direction: column;
                 align-items: center;
                 justify-content: center;
-                height: 100vh;
-            }}
-            .arcade-header {{
-                font-size: 1.5rem;
-                font-weight: bold;
-                color: #00ffcc;
-                text-shadow: 0 0 10px #00ffcc;
-                margin-bottom: 5px;
-                letter-spacing: 2px;
-            }}
-            .instructions {{
+            }
+            .arcade-header {
+                font-size: 1.4rem;
+                font-weight: 800;
+                color: #00f3ff;
+                text-shadow: 0 0 10px #00f3ff, 0 0 20px #00f3ff;
+                letter-spacing: 3px;
+                margin-bottom: 4px;
+            }
+            .instructions {
                 font-size: 0.8rem;
-                color: #8b949e;
-                margin-bottom: 10px;
-            }}
-            canvas {{
-                border: 4px solid #00ffcc;
-                box-shadow: 0 0 25px rgba(0, 255, 204, 0.4);
-                background: #000;
-                border-radius: 6px;
-            }}
-            .controls-hint {{
-                margin-top: 10px;
-                font-size: 0.85rem;
-                color: #c9d1d9;
-            }}
-            .key {{
-                background: #21262d;
-                border: 1px solid #30363d;
-                padding: 2px 6px;
+                color: #94a3b8;
+                margin-bottom: 8px;
+            }
+            canvas {
+                border: 2px solid #00f3ff;
+                box-shadow: 0 0 25px rgba(0, 243, 255, 0.35), inset 0 0 15px rgba(0, 243, 255, 0.2);
+                background: #030611;
+                border-radius: 8px;
+                cursor: pointer;
+            }
+            .controls-hint {
+                margin-top: 8px;
+                font-size: 0.8rem;
+                color: #cbd5e1;
+            }
+            .key {
+                background: #1e293b;
+                border: 1px solid #334155;
+                padding: 2px 7px;
                 border-radius: 4px;
-                color: #58a6ff;
+                color: #00f3ff;
                 font-weight: bold;
-            }}
+            }
         </style>
     </head>
     <body>
         <div id="game-container">
-            <div class="arcade-header">RETRO PONG ARCADE</div>
-            <div class="instructions">Difficulty: {difficulty} | First to {winning_score} wins!</div>
+            <div class="arcade-header">&#127918; NEON CYBER PONG ARCADE</div>
+            <div class="instructions">Difficulty: __DIFFICULTY__ | First to __WINNING_SCORE__ Wins | Sound &amp; Mouse Enabled</div>
             <canvas id="pongCanvas" width="700" height="400"></canvas>
             <div class="controls-hint">
-                Use <span class="key">▲</span> and <span class="key">▼</span> Arrow Keys or W/S keys to move paddle.
+                Controls: Drag <span class="key">Mouse/Touch</span> or use <span class="key">&#9650;</span> <span class="key">&#9660;</span> / <span class="key">W/S</span> &bull; <span class="key">P</span> to Pause &bull; Click Mute icon to toggle audio
             </div>
         </div>
 
@@ -220,204 +222,461 @@ def get_pong_html(difficulty: str) -> str:
             const canvas = document.getElementById("pongCanvas");
             const ctx = canvas.getContext("2d");
 
-            // Game objects
-            const ball = {{
+            // Web Audio Synthesizer (Procedural Sound Engine)
+            const AudioEngine = {
+                ctx: null,
+                muted: false,
+                init() {
+                    if (!this.ctx) {
+                        const AC = window.AudioContext || window.webkitAudioContext;
+                        if (AC) this.ctx = new AC();
+                    }
+                    if (this.ctx && this.ctx.state === "suspended") this.ctx.resume();
+                },
+                playTone(freq, type, duration, endFreq) {
+                    if (this.muted) return;
+                    try {
+                        this.init();
+                        if (!this.ctx) return;
+                        const osc = this.ctx.createOscillator();
+                        const gain = this.ctx.createGain();
+                        osc.type = type || "sine";
+                        osc.frequency.setValueAtTime(freq, this.ctx.currentTime);
+                        if (endFreq) osc.frequency.exponentialRampToValueAtTime(endFreq, this.ctx.currentTime + duration);
+                        gain.gain.setValueAtTime(0.15, this.ctx.currentTime);
+                        gain.gain.exponentialRampToValueAtTime(0.001, this.ctx.currentTime + duration);
+                        osc.connect(gain);
+                        gain.connect(this.ctx.destination);
+                        osc.start();
+                        osc.stop(this.ctx.currentTime + duration);
+                    } catch(e) {}
+                },
+                hit() { this.playTone(380, "square", 0.06, 180); },
+                wall() { this.playTone(280, "sine", 0.05, 360); },
+                score() {
+                    this.playTone(523, "sine", 0.12);
+                    setTimeout(() => this.playTone(659, "sine", 0.18), 100);
+                    setTimeout(() => this.playTone(784, "sine", 0.25), 200);
+                },
+                gameOver() { this.playTone(300, "sawtooth", 0.35, 120); }
+            };
+
+            // Game State Machine: 0 = MENU, 1 = PLAYING, 2 = PAUSED, 3 = GAME_OVER
+            let gameState = 0;
+            let winnerText = "";
+            let screenShake = 0;
+
+            // Background Stardust Particles
+            const stars = [];
+            for (let i = 0; i < 45; i++) {
+                stars.push({
+                    x: Math.random() * canvas.width,
+                    y: Math.random() * canvas.height,
+                    size: Math.random() * 1.8 + 0.5,
+                    alpha: Math.random() * 0.7 + 0.2,
+                    speed: Math.random() * 0.4 + 0.1
+                });
+            }
+
+            // Explosion Sparks Particle Engine
+            let particles = [];
+            function spawnSparks(x, y, color, count = 16) {
+                for (let i = 0; i < count; i++) {
+                    const angle = Math.random() * Math.PI * 2;
+                    const speed = Math.random() * 4 + 1.5;
+                    particles.push({
+                        x: x,
+                        y: y,
+                        vx: Math.cos(angle) * speed,
+                        vy: Math.sin(angle) * speed,
+                        radius: Math.random() * 2.5 + 1,
+                        alpha: 1,
+                        decay: Math.random() * 0.03 + 0.02,
+                        color: color
+                    });
+                }
+            }
+
+            // Game entities
+            const ball = {
                 x: canvas.width / 2,
                 y: canvas.height / 2,
                 radius: 8,
-                speed: 5,
-                velocityX: 5,
-                velocityY: 5,
-                color: "#00ffcc"
-            }};
+                speed: 5.5,
+                velocityX: 5.5,
+                velocityY: 5.5,
+                color: "#ffe600"
+            };
 
-            const player = {{
-                x: 10,
-                y: canvas.height / 2 - 40,
-                width: 12,
-                height: 80,
+            const player = {
+                x: 14,
+                y: canvas.height / 2 - 42,
+                width: 14,
+                height: 84,
                 score: 0,
-                color: "#58a6ff"
-            }};
+                color: "#00f3ff"
+            };
 
-            const ai = {{
-                x: canvas.width - 22,
-                y: canvas.height / 2 - 40,
-                width: 12,
-                height: 80,
+            const ai = {
+                x: canvas.width - 28,
+                y: canvas.height / 2 - 42,
+                width: 14,
+                height: 84,
                 score: 0,
-                color: "#ff5555"
-            }};
+                color: "#ff007f"
+            };
 
             // Controls
             let upPressed = false;
             let downPressed = false;
-            let gameStarted = true;
-            let gameOver = false;
-            let winnerText = "";
 
-            window.addEventListener("keydown", (e) => {{
-                if (e.key === "ArrowUp" || e.key === "w" || e.key === "W") {{
+            window.addEventListener("keydown", (e) => {
+                AudioEngine.init();
+                if (e.key === "ArrowUp" || e.key === "w" || e.key === "W") {
                     upPressed = true;
                     e.preventDefault();
-                }}
-                if (e.key === "ArrowDown" || e.key === "s" || e.key === "S") {{
+                }
+                if (e.key === "ArrowDown" || e.key === "s" || e.key === "S") {
                     downPressed = true;
                     e.preventDefault();
-                }}
-            }});
+                }
+                if (e.code === "Space") {
+                    e.preventDefault();
+                    if (gameState === 0) gameState = 1;
+                    else if (gameState === 3) resetMatch();
+                }
+                if (e.key === "p" || e.key === "P" || e.key === "Escape") {
+                    if (gameState === 1) gameState = 2;
+                    else if (gameState === 2) gameState = 1;
+                }
+            });
 
-            window.addEventListener("keyup", (e) => {{
-                if (e.key === "ArrowUp" || e.key === "w" || e.key === "W") {{
-                    upPressed = false;
-                }}
-                if (e.key === "ArrowDown" || e.key === "s" || e.key === "S") {{
-                    downPressed = false;
-                }}
-            }});
+            window.addEventListener("keyup", (e) => {
+                if (e.key === "ArrowUp" || e.key === "w" || e.key === "W") upPressed = false;
+                if (e.key === "ArrowDown" || e.key === "s" || e.key === "S") downPressed = false;
+            });
 
-            function drawRect(x, y, w, h, color) {{
-                ctx.fillStyle = color;
-                ctx.fillRect(x, y, w, h);
-            }}
+            // Mouse & Touch Controls
+            canvas.addEventListener("mousemove", (e) => {
+                const rect = canvas.getBoundingClientRect();
+                const mouseY = (e.clientY - rect.top) * (canvas.height / rect.height);
+                player.y = Math.max(0, Math.min(canvas.height - player.height, mouseY - player.height / 2));
+            });
 
-            function drawCircle(x, y, r, color) {{
-                ctx.fillStyle = color;
-                ctx.beginPath();
-                ctx.arc(x, y, r, 0, Math.PI * 2, false);
-                ctx.closePath();
-                ctx.fill();
-            }}
+            canvas.addEventListener("touchmove", (e) => {
+                e.preventDefault();
+                const rect = canvas.getBoundingClientRect();
+                const touchY = (e.touches[0].clientY - rect.top) * (canvas.height / rect.height);
+                player.y = Math.max(0, Math.min(canvas.height - player.height, touchY - player.height / 2));
+            }, { passive: false });
 
-            function drawText(text, x, y, color, font = "20px Courier New") {{
-                ctx.fillStyle = color;
-                ctx.font = font;
-                ctx.textAlign = "center";
-                ctx.fillText(text, x, y);
-            }}
+            canvas.addEventListener("click", (e) => {
+                AudioEngine.init();
+                const rect = canvas.getBoundingClientRect();
+                const clickX = (e.clientX - rect.left) * (canvas.width / rect.width);
+                const clickY = (e.clientY - rect.top) * (canvas.height / rect.height);
 
-            function drawNet() {{
-                for (let i = 0; i <= canvas.height; i += 15) {{
-                    drawRect(canvas.width / 2 - 1, i, 2, 10, "#30363d");
-                }}
-            }}
+                // Check Mute button click (top-right corner: x: 650..690, y: 10..40)
+                if (clickX >= 640 && clickX <= 690 && clickY >= 10 && clickY <= 40) {
+                    AudioEngine.muted = !AudioEngine.muted;
+                    return;
+                }
 
-            function collision(b, p) {{
-                b.top = b.y - b.radius;
-                b.bottom = b.y + b.radius;
-                b.left = b.x - b.radius;
-                b.right = b.x + b.radius;
+                if (gameState === 0) gameState = 1;
+                else if (gameState === 2) gameState = 1;
+                else if (gameState === 3) resetMatch();
+            });
 
-                p.top = p.y;
-                p.bottom = p.y + p.height;
-                p.left = p.x;
-                p.right = p.x + p.width;
+            function collision(b, p) {
+                return (
+                    b.x + b.radius > p.x &&
+                    b.x - b.radius < p.x + p.width &&
+                    b.y + b.radius > p.y &&
+                    b.y - b.radius < p.y + p.height
+                );
+            }
 
-                return b.right > p.left && b.bottom > p.top && b.left < p.right && b.top < p.bottom;
-            }}
-
-            function resetBall() {{
+            function resetBall(direction) {
                 ball.x = canvas.width / 2;
                 ball.y = canvas.height / 2;
-                ball.velocityX = -ball.velocityX;
-                ball.speed = 5;
-            }}
+                ball.speed = 5.5;
+                ball.velocityX = (direction || 1) * ball.speed;
+                ball.velocityY = (Math.random() > 0.5 ? 1 : -1) * (Math.random() * 3 + 3);
+            }
 
-            function update() {{
-                if (gameOver) return;
+            function resetMatch() {
+                player.score = 0;
+                ai.score = 0;
+                gameState = 1;
+                resetBall(1);
+            }
 
-                // Player movement
-                if (upPressed && player.y > 0) {{
-                    player.y -= 7;
-                }} else if (downPressed && player.y < canvas.height - player.height) {{
-                    player.y += 7;
-                }}
+            function update() {
+                // Update stars
+                for (let star of stars) {
+                    star.x -= star.speed;
+                    if (star.x < 0) star.x = canvas.width;
+                }
 
-                // AI movement with difficulty factor
-                let aiSpeedFactor = {ai_speed};
-                ai.y += (ball.y - (ai.y + ai.height / 2)) * aiSpeedFactor;
-                
-                // Restrict AI to canvas
-                if (ai.y < 0) ai.y = 0;
-                if (ai.y > canvas.height - ai.height) ai.y = canvas.height - ai.height;
+                // Update particles
+                for (let i = particles.length - 1; i >= 0; i--) {
+                    const p = particles[i];
+                    p.x += p.vx;
+                    p.y += p.vy;
+                    p.alpha -= p.decay;
+                    if (p.alpha <= 0) particles.splice(i, 1);
+                }
 
-                // Ball movement
+                if (screenShake > 0) screenShake--;
+
+                if (gameState !== 1) return;
+
+                // Keyboard Movement
+                if (upPressed && player.y > 0) player.y -= 7.5;
+                if (downPressed && player.y < canvas.height - player.height) player.y += 7.5;
+
+                // AI movement with smart tracking
+                const aiTarget = ball.y - ai.height / 2;
+                ai.y += (aiTarget - ai.y) * __AI_SPEED__;
+                ai.y = Math.max(0, Math.min(canvas.height - ai.height, ai.y));
+
+                // Ball Movement
                 ball.x += ball.velocityX;
                 ball.y += ball.velocityY;
 
-                // Wall collision (Top and Bottom)
-                if (ball.y - ball.radius < 0 || ball.y + ball.radius > canvas.height) {{
-                    ball.velocityY = -ball.velocityY;
-                }}
+                // Wall Collision (Top and Bottom)
+                if (ball.y - ball.radius <= 0) {
+                    ball.y = ball.radius;
+                    ball.velocityY = Math.abs(ball.velocityY);
+                    AudioEngine.wall();
+                    spawnSparks(ball.x, ball.y, "#ffe600", 8);
+                } else if (ball.y + ball.radius >= canvas.height) {
+                    ball.y = canvas.height - ball.radius;
+                    ball.velocityY = -Math.abs(ball.velocityY);
+                    AudioEngine.wall();
+                    spawnSparks(ball.x, ball.y, "#ffe600", 8);
+                }
 
-                // Paddle collision determination
-                let activePaddle = (ball.x < canvas.width / 2) ? player : ai;
+                // Paddle Collision
+                const activePaddle = (ball.x < canvas.width / 2) ? player : ai;
+                if (collision(ball, activePaddle)) {
+                    AudioEngine.hit();
+                    const collidePoint = (ball.y - (activePaddle.y + activePaddle.height / 2)) / (activePaddle.height / 2);
+                    const angleRad = (Math.PI / 4) * Math.max(-1, Math.min(1, collidePoint));
+                    const direction = (ball.x < canvas.width / 2) ? 1 : -1;
 
-                if (collision(ball, activePaddle)) {{
-                    let collidePoint = ball.y - (activePaddle.y + activePaddle.height / 2);
-                    collidePoint = collidePoint / (activePaddle.height / 2);
-
-                    let angleRad = (Math.PI / 4) * collidePoint;
-                    let direction = (ball.x < canvas.width / 2) ? 1 : -1;
-
+                    ball.speed = Math.min(ball.speed + 0.35, 12);
                     ball.velocityX = direction * ball.speed * Math.cos(angleRad);
                     ball.velocityY = ball.speed * Math.sin(angleRad);
-
-                    ball.speed += 0.3; // Incremental speed
-                }}
+                    spawnSparks(ball.x, ball.y, activePaddle.color, 16);
+                    screenShake = 3;
+                }
 
                 // Scoring
-                if (ball.x - ball.radius < 0) {{
+                if (ball.x - ball.radius < 0) {
                     ai.score++;
-                    resetBall();
-                }} else if (ball.x + ball.radius > canvas.width) {{
+                    AudioEngine.score();
+                    spawnSparks(ball.x, ball.y, ai.color, 25);
+                    screenShake = 6;
+                    if (ai.score >= __WINNING_SCORE__) {
+                        gameState = 3;
+                        winnerText = "AI WINS! 🤖";
+                        AudioEngine.gameOver();
+                    } else {
+                        resetBall(1);
+                    }
+                } else if (ball.x + ball.radius > canvas.width) {
                     player.score++;
-                    resetBall();
-                }}
+                    AudioEngine.score();
+                    spawnSparks(ball.x, ball.y, player.color, 25);
+                    screenShake = 6;
+                    if (player.score >= __WINNING_SCORE__) {
+                        gameState = 3;
+                        winnerText = "PLAYER WINS! 🏆";
+                        AudioEngine.score();
+                    } else {
+                        resetBall(-1);
+                    }
+                }
+            }
 
-                // Check Win Condition
-                if (player.score >= {winning_score}) {{
-                    gameOver = true;
-                    winnerText = "PLAYER WINS! 🏆";
-                }} else if (ai.score >= {winning_score}) {{
-                    gameOver = true;
-                    winnerText = "AI WINS! 🤖";
-                }}
-            }}
+            function render() {
+                ctx.save();
+                if (screenShake > 0) {
+                    const dx = (Math.random() - 0.5) * 6;
+                    const dy = (Math.random() - 0.5) * 6;
+                    ctx.translate(dx, dy);
+                }
 
-            function render() {{
-                // Clear canvas
-                drawRect(0, 0, canvas.width, canvas.height, "#050505");
-                
-                drawNet();
-                
-                // Draw scores
-                drawText(player.score, canvas.width / 4, canvas.height / 5, "#58a6ff", "40px Courier New");
-                drawText(ai.score, 3 * canvas.width / 4, canvas.height / 5, "#ff5555", "40px Courier New");
+                // Clear canvas with deep space gradient
+                const bgGrad = ctx.createLinearGradient(0, 0, 0, canvas.height);
+                bgGrad.addColorStop(0, "#050814");
+                bgGrad.addColorStop(1, "#030409");
+                ctx.fillStyle = bgGrad;
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-                // Draw paddles and ball
-                drawRect(player.x, player.y, player.width, player.height, player.color);
-                drawRect(ai.x, ai.y, ai.width, ai.height, ai.color);
-                drawCircle(ball.x, ball.y, ball.radius, ball.color);
+                // Draw background stars
+                for (let star of stars) {
+                    ctx.fillStyle = "rgba(255, 255, 255, " + star.alpha + ")";
+                    ctx.beginPath();
+                    ctx.arc(star.x, star.y, star.size, 0, Math.PI * 2);
+                    ctx.fill();
+                }
 
-                if (gameOver) {{
-                    drawRect(0, 0, canvas.width, canvas.height, "rgba(0, 0, 0, 0.85)");
-                    drawText(winnerText, canvas.width / 2, canvas.height / 2 - 20, "#00ffcc", "32px Courier New");
-                    drawText("Match complete! Check Streamlit panel to save score.", canvas.width / 2, canvas.height / 2 + 30, "#8b949e", "14px Courier New");
-                }}
-            }}
+                // Draw center net with glowing dashed line
+                ctx.save();
+                ctx.shadowBlur = 8;
+                ctx.shadowColor = "rgba(0, 243, 255, 0.4)";
+                ctx.strokeStyle = "rgba(0, 243, 255, 0.25)";
+                ctx.lineWidth = 2;
+                ctx.setLineDash([8, 8]);
+                ctx.beginPath();
+                ctx.moveTo(canvas.width / 2, 0);
+                ctx.lineTo(canvas.width / 2, canvas.height);
+                ctx.stroke();
+                ctx.restore();
 
-            function gameLoop() {{
+                // Draw Scores
+                ctx.save();
+                ctx.font = "bold 44px 'Courier New', monospace";
+                ctx.textAlign = "center";
+                ctx.shadowBlur = 12;
+                ctx.shadowColor = "#00f3ff";
+                ctx.fillStyle = "#00f3ff";
+                ctx.fillText(player.score, canvas.width / 4, 65);
+                ctx.shadowColor = "#ff007f";
+                ctx.fillStyle = "#ff007f";
+                ctx.fillText(ai.score, 3 * canvas.width / 4, 65);
+                ctx.restore();
+
+                // Draw Player Paddle (Neon Cyan Glow)
+                ctx.save();
+                ctx.shadowBlur = 15;
+                ctx.shadowColor = player.color;
+                ctx.fillStyle = player.color;
+                ctx.fillRect(player.x, player.y, player.width, player.height);
+                ctx.restore();
+
+                // Draw AI Paddle (Neon Magenta Glow)
+                ctx.save();
+                ctx.shadowBlur = 15;
+                ctx.shadowColor = ai.color;
+                ctx.fillStyle = ai.color;
+                ctx.fillRect(ai.x, ai.y, ai.width, ai.height);
+                ctx.restore();
+
+                // Draw Ball (Neon Yellow Glow)
+                ctx.save();
+                ctx.shadowBlur = 18;
+                ctx.shadowColor = ball.color;
+                ctx.fillStyle = ball.color;
+                ctx.beginPath();
+                ctx.arc(ball.x, ball.y, ball.radius, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.restore();
+
+                // Draw Particles
+                for (let p of particles) {
+                    ctx.save();
+                    ctx.shadowBlur = 8;
+                    ctx.shadowColor = p.color;
+                    ctx.fillStyle = p.color;
+                    ctx.globalAlpha = Math.max(0, p.alpha);
+                    ctx.beginPath();
+                    ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+                    ctx.fill();
+                    ctx.restore();
+                }
+
+                // Draw Sound Mute Toggle Icon at top-right
+                ctx.save();
+                ctx.font = "16px sans-serif";
+                ctx.textAlign = "right";
+                ctx.fillStyle = AudioEngine.muted ? "#64748b" : "#00f3ff";
+                ctx.fillText(AudioEngine.muted ? "🔇 MUTED" : "🔊 SOUND", canvas.width - 15, 28);
+                ctx.restore();
+
+                // STATE OVERLAYS
+                if (gameState === 0) {
+                    // Menu / Title Screen
+                    ctx.fillStyle = "rgba(4, 7, 18, 0.85)";
+                    ctx.fillRect(0, 0, canvas.width, canvas.height);
+                    ctx.save();
+                    ctx.textAlign = "center";
+                    ctx.shadowBlur = 20;
+                    ctx.shadowColor = "#00f3ff";
+                    ctx.fillStyle = "#00f3ff";
+                    ctx.font = "bold 32px 'Courier New', monospace";
+                    ctx.fillText("NEON CYBER PONG", canvas.width / 2, canvas.height / 2 - 40);
+
+                    const pulse = Math.abs(Math.sin(Date.now() / 350));
+                    ctx.shadowBlur = 10 * pulse;
+                    ctx.fillStyle = "#ffe600";
+                    ctx.font = "bold 16px 'Courier New', monospace";
+                    ctx.fillText("CLICK OR PRESS SPACE TO START", canvas.width / 2, canvas.height / 2 + 15);
+
+                    ctx.fillStyle = "#94a3b8";
+                    ctx.font = "12px 'Courier New', monospace";
+                    ctx.fillText("Move: Mouse Drag or Arrow Keys / W-S | P: Pause", canvas.width / 2, canvas.height / 2 + 55);
+                    ctx.restore();
+                } else if (gameState === 2) {
+                    // Paused Screen
+                    ctx.fillStyle = "rgba(4, 7, 18, 0.75)";
+                    ctx.fillRect(0, 0, canvas.width, canvas.height);
+                    ctx.save();
+                    ctx.textAlign = "center";
+                    ctx.shadowBlur = 15;
+                    ctx.shadowColor = "#ffe600";
+                    ctx.fillStyle = "#ffe600";
+                    ctx.font = "bold 28px 'Courier New', monospace";
+                    ctx.fillText("PAUSED", canvas.width / 2, canvas.height / 2 - 10);
+                    ctx.fillStyle = "#94a3b8";
+                    ctx.font = "14px 'Courier New', monospace";
+                    ctx.fillText("PRESS 'P' OR CLICK TO RESUME", canvas.width / 2, canvas.height / 2 + 30);
+                    ctx.restore();
+                } else if (gameState === 3) {
+                    // Game Over Screen
+                    ctx.fillStyle = "rgba(4, 7, 18, 0.85)";
+                    ctx.fillRect(0, 0, canvas.width, canvas.height);
+                    ctx.save();
+                    ctx.textAlign = "center";
+                    ctx.shadowBlur = 20;
+                    ctx.shadowColor = player.score >= __WINNING_SCORE__ ? "#00f3ff" : "#ff007f";
+                    ctx.fillStyle = player.score >= __WINNING_SCORE__ ? "#00f3ff" : "#ff007f";
+                    ctx.font = "bold 34px 'Courier New', monospace";
+                    ctx.fillText(winnerText, canvas.width / 2, canvas.height / 2 - 40);
+
+                    ctx.shadowBlur = 8;
+                    ctx.fillStyle = "#ffffff";
+                    ctx.font = "bold 18px 'Courier New', monospace";
+                    ctx.fillText("FINAL SCORE: " + player.score + " - " + ai.score, canvas.width / 2, canvas.height / 2 + 5);
+
+                    ctx.fillStyle = "#ffe600";
+                    ctx.font = "bold 15px 'Courier New', monospace";
+                    ctx.fillText("PRESS SPACE OR CLICK TO PLAY AGAIN", canvas.width / 2, canvas.height / 2 + 45);
+
+                    ctx.fillStyle = "#94a3b8";
+                    ctx.font = "12px 'Courier New', monospace";
+                    ctx.fillText("Record your score below in the Leaderboard form!", canvas.width / 2, canvas.height / 2 + 75);
+                    ctx.restore();
+                }
+
+                ctx.restore();
+            }
+
+            function gameLoop() {
                 update();
                 render();
                 requestAnimationFrame(gameLoop);
-            }}
+            }
 
             gameLoop();
         </script>
     </body>
     </html>
     """
+
+    return raw_html.replace("__DIFFICULTY__", difficulty).replace("__AI_SPEED__", str(ai_speed)).replace("__WINNING_SCORE__", str(winning_score))
 
 
 # --- STREAMLIT USER INTERFACE --- 
