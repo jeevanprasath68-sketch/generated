@@ -1,6 +1,6 @@
 # Generated Application
 
-**Requirement:** Build an arcade Galaxy Space Shooter game featuring retro glowing vector ships, procedural laser and explosion sounds via Web Audio, dynamic particle sparks, progressive enemy waves, power-up shields/multishot, and a persistent SQLite high-score table.
+**Requirement:** create a small scale industries human resource app that manages log in and log out time, wages of each employee and advance payment and their weekly payment
 
 **Format:** Streamlit Web App
 

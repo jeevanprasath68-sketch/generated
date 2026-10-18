@@ -1,92 +1,82 @@
-"""
-Exhaustive pytest suite for Galaxy Space Shooter backend components.
-"""
-
-import os
 import pytest
-from app import LeaderboardDB, DifficultyManager, DB_PATH
+import datetime
+import os
+from app import HREngine
 
-@pytest.fixture(autouse=True)
-def clean_test_db():
-    if os.path.exists(DB_PATH):
-        try:
-            os.remove(DB_PATH)
-        except PermissionError:
-            pass
-    yield
-    if os.path.exists(DB_PATH):
-        try:
-            os.remove(DB_PATH)
-        except PermissionError:
-            pass
+@pytest.fixture
+def py_engine(tmp_path):
+    db_file = tmp_path / "test_ssi.sqlite"
+    engine = HREngine(db_path=str(db_file))
+    return engine
 
+def test_add_employee_happy_path(py_engine):
+    emp_id = py_engine.add_employee("Alice Smith", "Machinist", 20.0)
+    assert emp_id > 0
+    
+    employees = py_engine.get_employees()
+    assert len(employees) == 1
+    assert employees[0]["name"] == "Alice Smith"
+    assert employees[0]["hourly_rate"] == 20.0
 
-def test_leaderboard_initialization():
-    db = LeaderboardDB(db_path=DB_PATH)
-    stats = db.get_stats()
-    assert stats["total_games"] == 0
-    assert stats["high_score"] == 0
-    assert stats["avg_score"] == 0
+def test_add_employee_validation_errors(py_engine):
+    with pytest.raises(ValueError):
+        py_engine.add_employee("   ", "Operator", 15.0)
 
+    with pytest.raises(ValueError):
+        py_engine.add_employee("Bob Jones", "Welder", -5.0)
 
-def test_add_score_and_retrieve():
-    db = LeaderboardDB(db_path=DB_PATH)
-    db.add_score("ViperOne", 1500, "Standard")
-    db.add_score("Maverick", 3400, "Pro")
+def test_log_time_and_hours_calculation(py_engine):
+    emp_id = py_engine.add_employee("Charlie Brown", "Technician", 10.0)
+    today_str = datetime.date.today().isoformat()
+    
+    # 8 hours shift (09:00 to 17:00)
+    log_id = py_engine.log_time(emp_id, today_str, "09:00", "17:00")
+    assert log_id > 0
 
-    top = db.get_top_scores(limit=5)
-    assert len(top) == 2
-    assert top[0][0] == "Maverick"
-    assert top[0][1] == 3400
-    assert top[0][2] == "Pro"
+    logs = py_engine.get_time_logs(emp_id)
+    assert len(logs) == 1
+    assert logs[0]["hours_worked"] == 8.0
 
-    stats = db.get_stats()
-    assert stats["total_games"] == 2
-    assert stats["high_score"] == 3400
-    assert stats["avg_score"] == 2450
+def test_log_time_invalid_interval(py_engine):
+    emp_id = py_engine.add_employee("Diana Prince", "Supervisor", 25.0)
+    today_str = datetime.date.today().isoformat()
+    
+    with pytest.raises(ValueError):
+        # Logout before login
+        py_engine.log_time(emp_id, today_str, "17:00", "09:00")
 
+def test_advance_payment_handling(py_engine):
+    emp_id = py_engine.add_employee(
+        name="Eve Adams",
+        role="Assembler",
+        hourly_rate=12.0
+    )
+    today_str = datetime.date.today().isoformat()
+    
+    adv_id = py_engine.add_advance(emp_id, today_str, 50.0, "Medical")
+    assert adv_id > 0
 
-def test_difficulty_filtering():
-    db = LeaderboardDB(db_path=DB_PATH)
-    db.add_score("PilotA", 1000, "Casual")
-    db.add_score("PilotB", 2500, "Impossible")
+    advances = py_engine.get_advances(emp_id)
+    assert len(advances) == 1
+    assert advances[0]["amount"] == 50.0
 
-    casual_scores = db.get_top_scores(difficulty="Casual")
-    assert len(casual_scores) == 1
-    assert casual_scores[0][0] == "PilotA"
+    with pytest.raises(ValueError):
+        py_engine.add_advance(emp_id, today_str, -10.0, "Invalid")
 
-    impossible_scores = db.get_top_scores(difficulty="Impossible")
-    assert len(impossible_scores) == 1
-    assert impossible_scores[0][0] == "PilotB"
-
-
-def test_anonymous_and_empty_names():
-    db = LeaderboardDB(db_path=DB_PATH)
-    db.add_score("   ", 800, "Standard")
-    top = db.get_top_scores()
-    assert len(top) == 1
-    assert top[0][0] == "Anonymous"
-    assert top[0][1] == 800
-
-
-def test_difficulty_manager_bounds():
-    casual = DifficultyManager.get_config("Casual")
-    assert casual["player_lives"] == 5
-    assert casual["score_multiplier"] == 1.0
-
-    impossible = DifficultyManager.get_config("Impossible")
-    assert impossible["player_lives"] == 1
-    assert impossible["score_multiplier"] == 3.0
-
-    unknown = DifficultyManager.get_config("NonExistent")
-    assert unknown["player_lives"] == 3
-
-
-def test_database_reset():
-    db = LeaderboardDB(db_path=DB_PATH)
-    db.add_score("Ace", 5000, "Pro")
-    assert db.get_stats()["total_games"] == 1
-
-    db.reset_database()
-    assert db.get_stats()["total_games"] == 0
-    assert db.get_stats()["high_score"] == 0
+def test_weekly_payroll_calculation(py_engine):
+    emp_id = py_engine.add_employee("Frank White", "Helper", 15.0)
+    date_str = "2023-10-10"
+    
+    # 10 hours work -> Gross: $150
+    py_engine.log_time(emp_id, date_str, "08:00", "18:00")
+    
+    # Advance: $40
+    py_engine.add_advance(emp_id, date_str, 40.0, "Uniform")
+    
+    summary = py_engine.calculate_weekly_payroll("2023-10-01", "2023-10-31")
+    assert len(summary) == 1
+    rec = summary[0]
+    assert rec["total_hours"] == 10.0
+    assert rec["gross_wage"] == 150.0
+    assert rec["total_advances"] == 40.0
+    assert rec["net_pay"] == 110.0
