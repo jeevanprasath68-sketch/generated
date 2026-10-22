@@ -1,136 +1,78 @@
-import os
 import pytest
-import datetime
-from app import ItemManager
+import sqlite3
+import os
+from app import DatabaseManager, ChatEngine, SessionManager, DB_NAME
 
-@pytest.fixture
-def temp_db(tmp_path):
-    db_file = tmp_path / "test_campusfind.db"
-    manager = ItemManager(db_path=str(db_file))
-    return manager
+@pytest.fixture(autouse=True)
+def setup_test_db():
+    # Setup fresh DB for each test
+    if os.path.exists(DB_NAME):
+        os.remove(DB_NAME)
+    DatabaseManager.init_db()
+    yield
+    if os.path.exists(DB_NAME):
+        os.remove(DB_NAME)
 
-def test_add_and_get_item(temp_db):
-    item_data = {
-        "title": "MacBook Pro",
-        "category": "Electronics",
-        "description": "Space Gray 14-inch M2",
-        "location": "Student Union",
-        "status": "Lost",
-        "reporter_name": "Alice Smith",
-        "reporter_contact": "alice@college.edu",
-        "date_posted": datetime.date.today().isoformat()
-    }
-    
-    item_id = temp_db.add_item(item_data)
-    assert item_id > 0
-    
-    items = temp_db.get_items()
-    assert len(items) == 1
-    assert items[0]["title"] == "MacBook Pro"
-    assert items[0]["category"] == "Electronics"
-    assert items[0]["claim_status"] == "Unclaimed"
+def test_database_initialization_and_personas():
+    """Test that database initializes and seeds default personas correctly."""
+    personas = SessionManager.get_personas()
+    assert len(personas) >= 4
+    names = [p["name"] for p in personas]
+    assert "Friendly Assistant" in names
+    assert "Senior Software Architect" in names
 
-def test_missing_required_fields(temp_db):
-    item_data = {
-        "title": "Incomplete Item",
-        "category": "Keys",
-        "description": "Missing contact info",
-        "location": "Library",
-        "status": "Found",
-        "reporter_name": "Bob",
-        "reporter_contact": ""
-    }
+def test_session_creation_and_messaging():
+    """Test creating sessions, adding messages, and retrieving message history."""
+    personas = SessionManager.get_personas()
+    persona_id = personas[0]["id"]
     
-    with pytest.raises(ValueError, match="Missing required field"):
-        temp_db.add_item(item_data)
+    session_id = SessionManager.create_session("Test Session", persona_id)
+    assert session_id is not None
+    
+    SessionManager.add_message(session_id, "user", "Hello AI", tokens_used=5)
+    SessionManager.add_message(session_id, "assistant", "Hello Human!", tokens_used=8)
+    
+    messages = SessionManager.get_messages(session_id)
+    assert len(messages) == 2
+    assert messages[0]["role"] == "user"
+    assert messages[0]["content"] == "Hello AI"
+    assert messages[0]["tokens_used"] == 5
+    assert messages[1]["role"] == "assistant"
+    assert messages[1]["content"] == "Hello Human!"
 
-def test_invalid_status(temp_db):
-    item_data = {
-        "title": "Bad Status Item",
-        "category": "Other",
-        "description": "Some description",
-        "location": "Quad",
-        "status": "Stolen",  # Invalid status
-        "reporter_name": "Charlie",
-        "reporter_contact": "charlie@college.edu"
-    }
+def test_chat_engine_responses():
+    """Test that ChatEngine returns correctly structured response dict with content and tokens."""
+    prompt = "How do I optimize database queries?"
+    system_prompt = "You are an expert Principal Software Architect"
     
-    with pytest.raises(ValueError, match="Status must be either 'Lost' or 'Found'"):
-        temp_db.add_item(item_data)
+    response = ChatEngine.generate_response(prompt, system_prompt, temperature=0.5, model_name="OmniBot-v4-Turbo")
+    
+    assert isinstance(response, dict)
+    assert "content" in response
+    assert "tokens_used" in response
+    assert isinstance(response["content"], str)
+    assert len(response["content"]) > 0
+    assert response["tokens_used"] > 0
 
-def test_search_and_filter(temp_db):
-    temp_db.add_item({
-        "title": "Calculus Textbook",
-        "category": "Books & Notes",
-        "description": "Stewart Calculus 8th Edition",
-        "location": "Science Hall",
-        "status": "Lost",
-        "reporter_name": "Dave",
-        "reporter_contact": "dave@college.edu"
-    })
+def test_add_custom_persona():
+    """Test adding a custom persona and retrieving it."""
+    SessionManager.add_persona("Chef Gordon", "You are a passionate culinary master.", "Kitchen expert")
+    personas = SessionManager.get_personas()
     
-    temp_db.add_item({
-        "title": "Car Keys",
-        "category": "Keys",
-        "description": "Toyota fob with blue lanyard",
-        "location": "Parking Lot C",
-        "status": "Found",
-        "reporter_name": "Eve",
-        "reporter_contact": "eve@college.edu"
-    })
-    
-    # Test search query
-    results = temp_db.get_items(search_query="Toyota")
-    assert len(results) == 1
-    assert results[0]["title"] == "Car Keys"
-    
-    # Test category filter
-    results_cat = temp_db.get_items(category="Books & Notes")
-    assert len(results_cat) == 1
-    assert results_cat[0]["title"] == "Calculus Textbook"
-    
-    # Test status filter
-    results_status = temp_db.get_items(status="Found")
-    assert len(results_status) == 1
-    assert results_status[0]["title"] == "Car Keys"
+    chef = next((p for p in personas if p["name"] == "Chef Gordon"), None)
+    assert chef is not None
+    assert "culinary master" in chef["system_prompt"]
 
-def test_submit_and_update_claim(temp_db):
-    item_id = temp_db.add_item({
-        "title": "Blue Water Bottle",
-        "category": "Other",
-        "description": "HydroFlask 32oz",
-        "location": "Gym",
-        "status": "Found",
-        "reporter_name": "Frank",
-        "reporter_contact": "frank@college.edu"
-    })
+def test_database_reset():
+    """Test that reset_database wipes sessions and messages while keeping schema valid."""
+    personas = SessionManager.get_personas()
+    session_id = SessionManager.create_session("Wipe Test", personas[0]["id"])
+    SessionManager.add_message(session_id, "user", "Test message")
     
-    # Submit claim
-    success = temp_db.submit_claim(item_id, "Grace", "grace@college.edu", "Has a sticker on the bottom")
-    assert success is True
+    assert len(SessionManager.get_sessions()) == 1
     
-    items = temp_db.get_items()
-    assert items[0]["claim_status"] == "Pending Claim"
-    assert items[0]["claimant_name"] == "Grace"
+    DatabaseManager.reset_database()
     
-    # Update claim status
-    success_update = temp_db.update_claim_status(item_id, "Resolved / Returned")
-    assert success_update is True
-    
-    items_updated = temp_db.get_items()
-    assert items_updated[0]["claim_status"] == "Resolved / Returned"
-
-def test_database_reset(temp_db):
-    temp_db.add_item({
-        "title": "Umbrella",
-        "category": "Clothing",
-        "description": "Black compact umbrella",
-        "location": "Student Center",
-        "status": "Lost",
-        "reporter_name": "Heidi",
-        "reporter_contact": "heidi@college.edu"
-    })
-    assert len(temp_db.get_items()) == 1
-    
-    temp_db.reset_database()
-    assert len(temp_db.get_items()) == 0
+    # Sessions should be empty, but personas re-seeded
+    assert len(SessionManager.get_sessions()) == 0
+    assert len(SessionManager.get_personas()) >= 4

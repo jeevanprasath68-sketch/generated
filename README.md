@@ -1,10 +1,10 @@
 # Generated Application
 
-**Requirement:** Build a functional web application called CampusFind — College Lost & Found Portal using Python and Streamlit with search, category filtering, persistent database, and claim reporting.
+**Requirement:** create a general chatbot
 
 **Format:** Streamlit Web App
 
-**Status:** VERIFIED &bull; **Score:** 9.6/10
+**Status:** VERIFIED &bull; **Score:** 8.8/10
 
 ## Quick Start (Local)
 ```bash

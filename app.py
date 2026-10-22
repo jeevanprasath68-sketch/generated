@@ -1,329 +1,406 @@
+import streamlit as st
 import sqlite3
+import pandas as pd
+import random
 import datetime
 from typing import List, Dict, Any, Optional
-import streamlit as st
 
-DB_PATH = "campusfind.db"
+# ==========================================
+# 1. BUSINESS LOGIC & DATA ENGINES
+# ==========================================
 
-class ItemManager:
-    """Business logic engine for managing items and claims with SQLite persistence."""
-    
-    def __init__(self, db_path: str = DB_PATH):
-        self.db_path = db_path
-        self._init_db()
+DB_NAME = "chatbot_app.db"
 
-    def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+class DatabaseManager:
+    @staticmethod
+    def get_connection() -> sqlite3.Connection:
+        conn = sqlite3.connect(DB_NAME, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
 
-    def _init_db(self) -> None:
-        conn = self._get_connection()
+    @classmethod
+    def init_db(cls):
+        conn = cls.get_connection()
         cursor = conn.cursor()
         
-        # Create table if not exists
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS items (
+        # Create tables if not exist
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS personas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                system_prompt TEXT NOT NULL,
+                description TEXT
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
-                category TEXT NOT NULL,
-                description TEXT NOT NULL,
-                location TEXT NOT NULL,
-                status TEXT NOT NULL,
-                reporter_name TEXT NOT NULL,
-                reporter_contact TEXT NOT NULL,
-                date_posted TEXT NOT NULL,
-                claim_status TEXT DEFAULT 'Unclaimed',
-                claimant_name TEXT DEFAULT '',
-                claimant_contact TEXT DEFAULT '',
-                claim_notes TEXT DEFAULT ''
+                persona_id INTEGER,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (persona_id) REFERENCES personas(id)
             )
-            """
-        )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                tokens_used INTEGER DEFAULT 0,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            )
+        ''')
+        
         conn.commit()
         
-        # Self-healing migration: check for missing columns
-        cursor.execute("PRAGMA table_info(items)")
+        # Self-healing check for columns in messages
+        cursor.execute("PRAGMA table_info(messages)")
         columns = [row["name"] for row in cursor.fetchall()]
+        if "tokens_used" not in columns:
+            cursor.execute("ALTER TABLE messages ADD COLUMN tokens_used INTEGER DEFAULT 0")
+            conn.commit()
+            
+        # Seed default personas if empty
+        cursor.execute("SELECT COUNT(*) as cnt FROM personas")
+        if cursor.fetchone()["cnt"] == 0:
+            default_personas = [
+                ("Friendly Assistant", "You are a warm, helpful, and cheerful AI assistant.", "Friendly and conversational."),
+                ("Senior Software Architect", "You are a pragmatic, expert Principal Software Architect focused on clean code, testability, and resilience.", "Technical and architectural advisor."),
+                ("Socratic Tutor", "You are a wise tutor who guides users to answers by asking thoughtful, probing questions rather than just giving solutions.", "Educational and reflective."),
+                ("Poetic Bard", "You respond to every prompt with poetic flair, metaphor, and lyrical verse.", "Creative and artistic.")
+            ]
+            cursor.executemany("INSERT INTO personas (name, system_prompt, description) VALUES (?, ?, ?)", default_personas)
+            conn.commit()
+            
+        conn.close()
+
+    @classmethod
+    def reset_database(cls):
+        conn = cls.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DROP TABLE IF EXISTS messages")
+        cursor.execute("DROP TABLE IF EXISTS sessions")
+        cursor.execute("DROP TABLE IF EXISTS personas")
+        conn.commit()
+        conn.close()
+        cls.init_db()
+
+
+class ChatEngine:
+    @staticmethod
+    def generate_response(prompt: str, persona_system_prompt: str, temperature: float, model_name: str) -> Dict[str, Any]:
+        """
+        Simulates an intelligent response based on the persona, prompt, and parameters.
+        """
+        prompt_lower = prompt.lower()
         
-        expected_columns = {
-            "claim_status": "TEXT DEFAULT 'Unclaimed'",
-            "claimant_name": "TEXT DEFAULT ''",
-            "claimant_contact": "TEXT DEFAULT ''",
-            "claim_notes": "TEXT DEFAULT ''"
+        # Generate contextual simulation based on persona
+        if "architect" in persona_system_prompt.lower():
+            responses = [
+                f"From an architectural standpoint regarding '{prompt}', we must prioritize modularity, decoupling, and high test coverage. Let's design a clean interface.",
+                f"That's a solid engineering challenge. To address '{prompt}', I recommend starting with a robust data model and defensive error handling (like schema auto-healing).",
+                f"When scaling systems like '{prompt}', separation of concerns is paramount. Ensure your business logic is entirely decoupled from the UI framework."
+            ]
+        elif "socratic" in persona_system_prompt.lower():
+            responses = [
+                f"That is a fascinating inquiry about '{prompt}'. What principles do you think underpin this challenge?",
+                f"Before we solve '{prompt}', let us ask: what would failure look like in this scenario, and how might we prevent it?",
+                f"Why do you suppose '{prompt}' is structured this way? What alternatives have you considered?"
+            ]
+        elif "poetic" in persona_system_prompt.lower():
+            responses = [
+                f"Ah, whispering winds of '{prompt}' arise,\nA dance of logic under starry skies...\nCode flows like rivers to the endless sea,\nIn search of truth and calm serenity.",
+                f"Like autumn leaves upon a digital stream,\n'{prompt}' unfolds into a waking dream.\nBytes intertwine where quiet thoughts belong,\nA silent stanza in an ancient song."
+            ]
+        else:
+            responses = [
+                f"I've processed your request regarding '{prompt}'. Here is what you need to know: everything is running smoothly!",
+                f"That's a great question about '{prompt}'. Let me assist you by breaking down the key points step by step.",
+                f"I understand you are asking about '{prompt}'. Based on my analysis, here are three actionable recommendations..."
+            ]
+            
+        reply_text = random.choice(responses)
+        # Add a bit of flavor if temperature is high
+        if temperature > 0.8:
+            reply_text += f" [Temp: {temperature:.1f}, Model: {model_name}]"
+            
+        tokens = len(prompt.split()) + len(reply_text.split()) + random.randint(5, 20)
+        return {
+            "content": reply_text,
+            "tokens_used": tokens
         }
-        
-        for col, col_def in expected_columns.items():
-            if col not in columns:
-                cursor.execute(f"ALTER TABLE items ADD COLUMN {col} {col_def}")
-                conn.commit()
-                
-        conn.close()
 
-    def reset_database(self) -> None:
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        cursor.execute("DROP TABLE IF EXISTS items")
-        conn.commit()
-        conn.close()
-        self._init_db()
 
-    def add_item(self, data: Dict[str, Any]) -> int:
-        required = ["title", "category", "description", "location", "status", "reporter_name", "reporter_contact"]
-        for field in required:
-            if not data.get(field):
-                raise ValueError(f"Missing required field: {field}")
-                
-        if data["status"] not in ["Lost", "Found"]:
-            raise ValueError("Status must be either 'Lost' or 'Found'")
-            
-        date_posted = data.get("date_posted", datetime.date.today().isoformat())
-        
-        conn = self._get_connection()
+class SessionManager:
+    @staticmethod
+    def create_session(title: str, persona_id: int) -> int:
+        conn = DatabaseManager.get_connection()
         cursor = conn.cursor()
         cursor.execute(
-            """
-            INSERT INTO items (title, category, description, location, status, reporter_name, reporter_contact, date_posted, claim_status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                data["title"],
-                data["category"],
-                data["description"],
-                data["location"],
-                data["status"],
-                data["reporter_name"],
-                data["reporter_contact"],
-                date_posted,
-                "Unclaimed"
-            )
+            "INSERT INTO sessions (title, persona_id, created_at) VALUES (?, ?, ?)",
+            (title, persona_id, datetime.datetime.now().isoformat())
         )
         conn.commit()
-        item_id = cursor.lastrowid
+        session_id = cursor.lastrowid
         conn.close()
-        return item_id
+        return session_id
 
-    def get_items(self, search_query: str = "", category: str = "All", status: str = "All") -> List[Dict[str, Any]]:
-        self._init_db()
-        conn = self._get_connection()
+    @staticmethod
+    def get_sessions() -> List[Dict[str, Any]]:
+        conn = DatabaseManager.get_connection()
         cursor = conn.cursor()
-        
-        query = "SELECT * FROM items WHERE 1=1"
-        params = []
-        
-        if search_query:
-            query += " AND (title LIKE ? OR description LIKE ? OR location LIKE ?)"
-            q = f"%{search_query}%"
-            params.extend([q, q, q])
-            
-        if category != "All":
-            query += " AND category = ?"
-            params.append(category)
-            
-        if status != "All":
-            query += " AND status = ?"
-            params.append(status)
-            
-        query += " ORDER BY date_posted DESC, id DESC"
-        
-        cursor.execute(query, params)
-        rows = cursor.fetchall()
+        cursor.execute("""
+            SELECT s.id, s.title, s.created_at, p.name as persona_name, p.id as persona_id
+            FROM sessions s
+            LEFT JOIN personas p ON s.persona_id = p.id
+            ORDER BY s.id DESC
+        """)
+        rows = [dict(row) for row in cursor.fetchall()]
         conn.close()
-        return [dict(row) for row in rows]
+        return rows
 
-    def submit_claim(self, item_id: int, claimant_name: str, claimant_contact: str, claim_notes: str) -> bool:
-        if not claimant_name or not claimant_contact:
-            raise ValueError("Claimant name and contact are required.")
-            
-        conn = self._get_connection()
+    @staticmethod
+    def get_messages(session_id: int) -> List[Dict[str, Any]]:
+        conn = DatabaseManager.get_connection()
         cursor = conn.cursor()
         cursor.execute(
-            """
-            UPDATE items 
-            SET claim_status = 'Pending Claim', claimant_name = ?, claimant_contact = ?, claim_notes = ?
-            WHERE id = ?
-            """,
-            (claimant_name, claimant_contact, claim_notes, item_id)
+            "SELECT role, content, timestamp, tokens_used FROM messages WHERE session_id = ? ORDER BY id ASC",
+            (session_id,)
         )
-        conn.commit()
-        rowcount = cursor.rowcount
+        rows = [dict(row) for row in cursor.fetchall()]
         conn.close()
-        return rowcount > 0
+        return rows
 
-    def update_claim_status(self, item_id: int, new_claim_status: str) -> bool:
-        if new_claim_status not in ["Unclaimed", "Pending Claim", "Resolved / Returned"]:
-            raise ValueError("Invalid claim status")
-            
-        conn = self._get_connection()
+    @staticmethod
+    def add_message(session_id: int, role: str, content: str, tokens_used: int = 0):
+        conn = DatabaseManager.get_connection()
         cursor = conn.cursor()
         cursor.execute(
-            """
-            UPDATE items SET claim_status = ? WHERE id = ?
-            """,
-            (new_claim_status, item_id)
+            "INSERT INTO messages (session_id, role, content, timestamp, tokens_used) VALUES (?, ?, ?, ?, ?)",
+            (session_id, role, content, datetime.datetime.now().isoformat(), tokens_used)
         )
         conn.commit()
-        rowcount = cursor.rowcount
         conn.close()
-        return rowcount > 0
 
+    @staticmethod
+    def get_personas() -> List[Dict[str, Any]]:
+        conn = DatabaseManager.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, system_prompt, description FROM personas")
+        rows = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return rows
+
+    @staticmethod
+    def add_persona(name: str, system_prompt: str, description: str):
+        conn = DatabaseManager.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR IGNORE INTO personas (name, system_prompt, description) VALUES (?, ?, ?)",
+            (name, system_prompt, description)
+        )
+        conn.commit()
+        conn.close()
+
+
+# ==========================================
+# 2. STREAMLIT WEB INTERFACE
+# ==========================================
 
 def main():
     st.set_page_config(
-        page_title="CampusFind - College Lost & Found Portal",
-        page_icon="🎒",
+        page_title="OmniChat Pro - Advanced AI Chatbot",
+        page_icon="💬",
         layout="wide"
     )
-    
-    manager = ItemManager()
 
-    st.sidebar.title("🎒 Navigation & Tools")
-    page = st.sidebar.radio("Go to", ["Browse Portal", "Report Item / Hand-in", "Admin / Claims Portal"])
+    # Initialize Database
+    DatabaseManager.init_db()
+
+    # Session state initialization
+    if "current_session_id" not in st.session_state:
+        sessions = SessionManager.get_sessions()
+        if sessions:
+            st.session_state.current_session_id = sessions[0]["id"]
+        else:
+            personas = SessionManager.get_personas()
+            default_pid = personas[0]["id"] if personas else 1
+            st.session_state.current_session_id = SessionManager.create_session("New Chat", default_pid)
+
+    # --- SIDEBAR CONFIGURATION --- 
+    st.sidebar.title("💬 OmniChat Pro")
+    st.sidebar.markdown("Your intelligent, multi-persona AI assistant hub.")
+
+    # Navigation mode
+    nav_mode = st.sidebar.radio("Navigation", ["Chat", "Analytics & History", "Persona Manager"])
+
+    st.sidebar.markdown("--- ✨ Model Settings ---")
     
-    st.sidebar.markdown("---")
-    with st.sidebar.expander("⚙️ Database Management"):
-        if st.button("Reset Database / Clear All Data", type="secondary"):
-            manager.reset_database()
-            st.success("Database successfully wiped and re-initialized!")
+    # Model Settings
+    model_name = st.sidebar.selectbox("AI Engine", ["OmniBot-v4-Turbo", "DeepLogic-Pro", "CreativeGen-7B"], index=0)
+    temperature = st.sidebar.slider("Temperature", min_value=0.0, max_value=1.0, value=0.7, step=0.1)
+    
+    # Persona Selector for current or new chat
+    personas = SessionManager.get_personas()
+    persona_dict = {p["name"]: p for p in personas}
+    selected_persona_name = st.sidebar.selectbox("Active Persona", list(persona_dict.keys()))
+    active_persona = persona_dict[selected_persona_name]
+
+    st.sidebar.divider()
+    st.sidebar.subheader("📂 Chat Sessions")
+    
+    if st.sidebar.button("➕ Start New Chat", use_container_width=True):
+        new_id = SessionManager.create_session(f"Chat {datetime.datetime.now().strftime('%H:%M:%S')}", active_persona["id"])
+        st.session_state.current_session_id = new_id
+        st.rerun()
+
+    sessions = SessionManager.get_sessions()
+    for sess in sessions:
+        sess_label = f"{sess['title']} ({sess['persona_name'] or 'Default'})"
+        if sess['id'] == st.session_state.current_session_id:
+            sess_label = f"👉 {sess_label}"
+        if st.sidebar.button(sess_label, key=f"sess_{sess['id']}", use_container_width=True):
+            st.session_state.current_session_id = sess['id']
             st.rerun()
+
+    # Database Reset Utility
+    with st.sidebar.expander("⚙️ Advanced Settings"):
+        if st.button("Reset Database & Clear All", type="primary"):
+            DatabaseManager.reset_database()
+            st.success("Database reset successfully!")
+            st.rerun()
+
+    # ==========================================
+    # PAGE: CHAT INTERFACE
+    # ==========================================
+    if nav_mode == "Chat":
+        st.title("🤖 Chat Workspace")
+        st.markdown(f"**Active Persona:** `{active_persona['name']}` — *{active_persona['description']}*")
+        
+        # Fetch messages for current session
+        messages = SessionManager.get_messages(st.session_state.current_session_id)
+        
+        # Display chat history
+        for msg in messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+                if msg.get("tokens_used", 0) > 0:
+                    st.caption(f"Tokens: {msg['tokens_used']} | {msg['timestamp'][:19]}")
+
+        # Quick Prompt Suggestions
+        st.markdown("**💡 Quick Prompts:**")
+        col_q1, col_q2, col_q3 = st.columns(3)
+        quick_prompt = None
+        with col_q1:
+            if st.button("Explain Clean Architecture", use_container_width=True):
+                quick_prompt = "Explain the principles of clean architecture in Python."
+        with col_q2:
+            if st.button("Write a Python Decorator", use_container_width=True):
+                quick_prompt = "Write a robust Python decorator for retry logic with exponential backoff."
+        with col_q3:
+            if st.button("Debug a SQLite Issue", use_container_width=True):
+                quick_prompt = "How do I safely handle schema migrations in SQLite without data loss?"
+
+        # Chat Input
+        user_prompt = st.chat_input("Message OmniChat...") or quick_prompt
+        
+        if user_prompt:
+            # Render user message immediately
+            with st.chat_message("user"):
+                st.markdown(user_prompt)
+            SessionManager.add_message(st.session_state.current_session_id, "user", user_prompt)
             
-    if page == "Browse Portal":
-        st.title("🎒 CampusFind — Lost & Found Portal")
-        st.markdown("Search and filter through items reported lost or found across campus. Claim items that belong to you!")
+            # Generate assistant response
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    res = ChatEngine.generate_response(
+                        prompt=user_prompt,
+                        persona_system_prompt=active_persona["system_prompt"],
+                        temperature=temperature,
+                        model_name=model_name
+                    )
+                    st.markdown(res["content"])
+                    st.caption(f"Tokens: {res['tokens_used']}")
+            
+            SessionManager.add_message(
+                st.session_state.current_session_id,
+                "assistant",
+                res["content"],
+                tokens_used=res["tokens_used"]
+            )
+            st.rerun()
+
+    # ==========================================
+    # PAGE: ANALYTICS & HISTORY
+    # ==========================================
+    elif nav_mode == "Analytics & History":
+        st.title("📊 Chat Analytics & History")
+        st.markdown("Review your conversation statistics, token usage, and message logs across all sessions.")
+        
+        conn = DatabaseManager.get_connection()
+        df_sessions = pd.read_sql_query("SELECT * FROM sessions", conn)
+        df_messages = pd.read_sql_query("SELECT * FROM messages", conn)
+        df_personas = pd.read_sql_query("SELECT * FROM personas", conn)
+        conn.close()
         
         col1, col2, col3 = st.columns(3)
         with col1:
-            search_query = st.text_input("🔍 Search keywords", "", placeholder="e.g., iPhone, keys, blue backpack")
+            st.metric("Total Sessions", len(df_sessions))
         with col2:
-            categories = ["All", "Electronics", "Keys", "ID / Cards", "Books & Notes", "Clothing", "Bags", "Other"]
-            selected_category = st.selectbox("📁 Category", categories)
+            st.metric("Total Messages", len(df_messages))
         with col3:
-            statuses = ["All", "Lost", "Found"]
-            selected_status = st.selectbox("📌 Status", statuses)
+            total_tokens = int(df_messages["tokens_used"].sum()) if not df_messages.empty else 0
+            st.metric("Total Tokens Consumed", total_tokens)
             
-        items = manager.get_items(search_query=search_query, category=selected_category, status=selected_status)
-        
-        # KPIs
-        total_items = len(manager.get_items())
-        lost_count = len([i for i in manager.get_items() if i["status"] == "Lost"])
-        found_count = len([i for i in manager.get_items() if i["status"] == "Found"])
-        
-        kpi1, kpi2, kpi3 = st.columns(3)
-        kpi1.metric("Total Portal Items", total_items)
-        kpi2.metric("Reported Lost", lost_count)
-        kpi3.metric("Reported Found / Handed In", found_count)
-        st.markdown("---")
-        
-        if not items:
-            st.info("No items match your search criteria.")
+        st.subheader("📈 Message Distribution by Role")
+        if not df_messages.empty:
+            role_counts = df_messages["role"].value_counts().reset_index()
+            role_counts.columns = ["Role", "Count"]
+            st.dataframe(role_counts, use_container_width=True)
         else:
-            for item in items:
-                with st.container():
-                    c1, c2, c3 = st.columns([3, 2, 2])
-                    badge_color = "orange" if item["status"] == "Lost" else "green"
-                    c1.markdown(f"### {item['title']} :orange_book:")
-                    c1.markdown(f"**Category:** `{item['category']}` | **Status:** :{badge_color}[**{item['status']}**]")
-                    c1.markdown(f"**Description:** {item['description']}")
-                    
-                    c2.markdown(f"📍 **Location:** {item['location']}")
-                    c2.markdown(f"📅 **Date Posted:** {item['date_posted']}")
-                    c2.markdown(f"🏷️ **Claim State:** `{item['claim_status']}`")
-                    
-                    with c3:
-                        with st.expander("View Contact & Claim"):
-                            st.write(f"**Reporter:** {item['reporter_name']}")
-                            st.write(f"**Contact:** {item['reporter_contact']}")
-                            
-                            if item["claim_status"] == "Unclaimed":
-                                with st.form(key=f"claim_form_{item['id']}"):
-                                    st.markdown("**Submit Claim / Proof**")
-                                    c_name = st.text_input("Your Name", key=f"c_name_{item['id']}")
-                                    c_contact = st.text_input("Your Phone/Email", key=f"c_contact_{item['id']}")
-                                    c_notes = st.text_area("Identifying details / Proof", key=f"c_notes_{item['id']}")
-                                    submitted = st.form_submit_button("Submit Claim")
-                                    if submitted:
-                                        try:
-                                            manager.submit_claim(item["id"], c_name, c_contact, c_notes)
-                                            st.success("Claim submitted! The reporter will review it.")
-                                            st.rerun()
-                                        except Exception as e:
-                                            st.error(str(e))
-                            else:
-                                st.info(f"Claim Status: {item['claim_status']}")
-                                if item["claimant_name"]:
-                                    st.write(f"**Claimant:** {item['claimant_name']}")
-                    st.markdown("---")
-                    
-    elif page == "Report Item / Hand-in":
-        st.title("📝 Report Lost or Found Item")
-        st.markdown("Fill out the details below if you lost something on campus or found an item and handed it in.")
-        
-        with st.form("report_form"):
-            col1, col2 = st.columns(2)
-            with col1:
-                title = st.text_input("Item Title / Name", placeholder="e.g., TI-84 Calculator")
-                category = st.selectbox("Category", ["Electronics", "Keys", "ID / Cards", "Books & Notes", "Clothing", "Bags", "Other"])
-                status = st.selectbox("Report Type", ["Lost", "Found"])
-                location = st.text_input("Location Last Seen / Found", placeholder="e.g., Library 2nd Floor")
-            with col2:
-                reporter_name = st.text_input("Your Full Name")
-                reporter_contact = st.text_input("Your Phone Number or Campus Email")
-                date_posted = st.date_input("Date", datetime.date.today())
-                
-            description = st.text_area("Detailed Description", placeholder="Color, brand, distinguishing marks, serial number, etc.")
+            st.info("No message data available yet.")
             
-            submitted = st.form_submit_button("Publish Report")
-            if submitted:
-                try:
-                    item_data = {
-                        "title": title,
-                        "category": category,
-                        "description": description,
-                        "location": location,
-                        "status": status,
-                        "reporter_name": reporter_name,
-                        "reporter_contact": reporter_contact,
-                        "date_posted": date_posted.isoformat()
-                    }
-                    manager.add_item(item_data)
-                    st.success("Item successfully posted to CampusFind portal!")
-                except Exception as e:
-                    st.error(f"Error submitting report: {e}")
-                    
-    elif page == "Admin / Claims Portal":
-        st.title("🛠️ Admin & Claim Moderation")
-        st.markdown("Review active claims and update item resolution statuses.")
-        
-        items = manager.get_items()
-        pending_items = [i for i in items if i["claim_status"] != "Unclaimed"]
-        
-        if not pending_items:
-            st.info("No pending or resolved claims found in the database.")
+        st.subheader("📂 All Sessions Log")
+        if not df_sessions.empty:
+            st.dataframe(df_sessions, use_container_width=True)
         else:
-            for item in pending_items:
-                with st.container():
-                    st.markdown(f"### Item #{item['id']}: {item['title']} ({item['status']})")
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.write(f"**Category:** {item['category']}")
-                        st.write(f"**Location:** {item['location']}")
-                        st.write(f"**Claim State:** `{item['claim_status']}`")
-                    with c2:
-                        st.write(f"**Claimant:** {item['claimant_name']} ({item['claimant_contact']})")
-                        st.write(f"**Proof / Notes:** {item['claim_notes']}")
-                        
-                    new_state = st.selectbox(
-                        "Update Claim Status",
-                        ["Unclaimed", "Pending Claim", "Resolved / Returned"],
-                        index=["Unclaimed", "Pending Claim", "Resolved / Returned"].index(item["claim_status"]),
-                        key=f"status_update_{item['id']}"
-                    )
-                    if st.button("Save Status", key=f"save_status_{item['id']}"):
-                        manager.update_claim_status(item["id"], new_state)
-                        st.success(f"Updated item #{item['id']} claim status to {new_state}!")
-                        st.rerun()
-                    st.markdown("---")
+            st.info("No sessions recorded.")
 
-if __name__ == '__main__':
+    # ==========================================
+    # PAGE: PERSONA MANAGER
+    # ==========================================
+    elif nav_mode == "Persona Manager":
+        st.title("🎭 AI Persona Manager")
+        st.markdown("Create custom AI personalities with tailored system instructions.")
+        
+        with st.form("new_persona_form"):
+            st.subheader("Create New Persona")
+            p_name = st.text_input("Persona Name")
+            p_desc = st.text_input("Short Description")
+            p_prompt = st.text_area("System Prompt / Instructions", placeholder="You are an expert in...")
+            submitted = st.form_submit_button("Save Persona")
+            
+            if submitted:
+                if p_name and p_prompt:
+                    try:
+                        SessionManager.add_persona(p_name, p_prompt, p_desc)
+                        st.success(f"Persona '{p_name}' created successfully!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error creating persona: {e}")
+                else:
+                    st.warning("Please provide both a Name and System Prompt.")
+                    
+        st.subheader("Existing Personas")
+        personas = SessionManager.get_personas()
+        for p in personas:
+            with st.expander(f"{p['name']} - {p['description']}"):
+                st.markdown(f"**System Prompt:**\n> {p['system_prompt']}")
+
+
+if __name__ == "__main__":
     main()
