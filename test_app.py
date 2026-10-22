@@ -1,78 +1,69 @@
 import pytest
-import sqlite3
 import os
-from app import DatabaseManager, ChatEngine, SessionManager, DB_NAME
+from app import GameConfig, LeaderboardDB
 
-@pytest.fixture(autouse=True)
-def setup_test_db():
-    # Setup fresh DB for each test
-    if os.path.exists(DB_NAME):
-        os.remove(DB_NAME)
-    DatabaseManager.init_db()
-    yield
-    if os.path.exists(DB_NAME):
-        os.remove(DB_NAME)
+@pytest.fixture
 
-def test_database_initialization_and_personas():
-    """Test that database initializes and seeds default personas correctly."""
-    personas = SessionManager.get_personas()
-    assert len(personas) >= 4
-    names = [p["name"] for p in personas]
-    assert "Friendly Assistant" in names
-    assert "Senior Software Architect" in names
+def temp_db(tmp_path):
+    db_file = tmp_path / "test_leaderboard.db"
+    db = LeaderboardDB(db_path=str(db_file))
+    return db
 
-def test_session_creation_and_messaging():
-    """Test creating sessions, adding messages, and retrieving message history."""
-    personas = SessionManager.get_personas()
-    persona_id = personas[0]["id"]
-    
-    session_id = SessionManager.create_session("Test Session", persona_id)
-    assert session_id is not None
-    
-    SessionManager.add_message(session_id, "user", "Hello AI", tokens_used=5)
-    SessionManager.add_message(session_id, "assistant", "Hello Human!", tokens_used=8)
-    
-    messages = SessionManager.get_messages(session_id)
-    assert len(messages) == 2
-    assert messages[0]["role"] == "user"
-    assert messages[0]["content"] == "Hello AI"
-    assert messages[0]["tokens_used"] == 5
-    assert messages[1]["role"] == "assistant"
-    assert messages[1]["content"] == "Hello Human!"
+def test_game_config_difficulties():
+    casual = GameConfig.get_settings("Casual")
+    assert casual["grid_size"] == 3
+    assert casual["time_limit"] == 120
+    assert casual["score_multiplier"] == 1.0
 
-def test_chat_engine_responses():
-    """Test that ChatEngine returns correctly structured response dict with content and tokens."""
-    prompt = "How do I optimize database queries?"
-    system_prompt = "You are an expert Principal Software Architect"
-    
-    response = ChatEngine.generate_response(prompt, system_prompt, temperature=0.5, model_name="OmniBot-v4-Turbo")
-    
-    assert isinstance(response, dict)
-    assert "content" in response
-    assert "tokens_used" in response
-    assert isinstance(response["content"], str)
-    assert len(response["content"]) > 0
-    assert response["tokens_used"] > 0
+    pro = GameConfig.get_settings("Pro")
+    assert pro["grid_size"] == 5
+    assert pro["score_multiplier"] == 2.2
 
-def test_add_custom_persona():
-    """Test adding a custom persona and retrieving it."""
-    SessionManager.add_persona("Chef Gordon", "You are a passionate culinary master.", "Kitchen expert")
-    personas = SessionManager.get_personas()
-    
-    chef = next((p for p in personas if p["name"] == "Chef Gordon"), None)
-    assert chef is not None
-    assert "culinary master" in chef["system_prompt"]
+    # Fallback default test
+    unknown = GameConfig.get_settings("NonExistent")
+    assert unknown["grid_size"] == 4
 
-def test_database_reset():
-    """Test that reset_database wipes sessions and messages while keeping schema valid."""
-    personas = SessionManager.get_personas()
-    session_id = SessionManager.create_session("Wipe Test", personas[0]["id"])
-    SessionManager.add_message(session_id, "user", "Test message")
-    
-    assert len(SessionManager.get_sessions()) == 1
-    
-    DatabaseManager.reset_database()
-    
-    # Sessions should be empty, but personas re-seeded
-    assert len(SessionManager.get_sessions()) == 0
-    assert len(SessionManager.get_personas()) >= 4
+def test_leaderboard_init_and_add(temp_db):
+    success = temp_db.add_score("CyberZero", 1500, "Standard")
+    assert success is True
+
+    top = temp_db.get_top_scores(limit=5)
+    assert len(top) == 1
+    assert top[0]["player_name"] == "CyberZero"
+    assert top[0]["score"] == 1500
+    assert top[0]["difficulty"] == "Standard"
+
+def test_leaderboard_sorting_and_limit(temp_db):
+    temp_db.add_score("PlayerA", 500, "Casual")
+    temp_db.add_score("PlayerB", 2500, "Pro")
+    temp_db.add_score("PlayerC", 1200, "Standard")
+
+    top = temp_db.get_top_scores(limit=2)
+    assert len(top) == 2
+    assert top[0]["score"] == 2500
+    assert top[0]["player_name"] == "PlayerB"
+    assert top[1]["score"] == 1200
+
+def test_leaderboard_stats(temp_db):
+    temp_db.add_score("Alpha", 1000, "Casual")
+    temp_db.add_score("Beta", 3000, "Pro")
+
+    stats = temp_db.get_stats()
+    assert stats["total_games"] == 2
+    assert stats["high_score"] == 3000
+    assert stats["avg_score"] == 2000.0
+
+def test_invalid_score_submission(temp_db):
+    success_empty = temp_db.add_score("", 500, "Casual")
+    assert success_empty is False
+
+    success_negative = temp_db.add_score("ValidUser", -100, "Casual")
+    assert success_negative is False
+
+def test_reset_leaderboard(temp_db):
+    temp_db.add_score("TestUser", 800, "Standard")
+    assert temp_db.get_stats()["total_games"] == 1
+
+    temp_db.reset_leaderboard()
+    assert temp_db.get_stats()["total_games"] == 0
+    assert len(temp_db.get_top_scores()) == 0

@@ -1,406 +1,622 @@
-import streamlit as st
 import sqlite3
-import pandas as pd
-import random
+import streamlit as st
+import streamlit.components.v1 as components
 import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Tuple
 
-# ==========================================
-# 1. BUSINESS LOGIC & DATA ENGINES
-# ==========================================
+DB_FILE = "puzzle_game_leaderboard.db"
 
-DB_NAME = "chatbot_app.db"
+class GameConfig:
+    DIFFICULTIES = {
+        "Casual": {"grid_size": 3, "time_limit": 120, "score_multiplier": 1.0},
+        "Standard": {"grid_size": 4, "time_limit": 90, "score_multiplier": 1.5},
+        "Pro": {"grid_size": 5, "time_limit": 60, "score_multiplier": 2.2},
+        "Impossible": {"grid_size": 6, "time_limit": 45, "score_multiplier": 3.5}
+    }
 
-class DatabaseManager:
-    @staticmethod
-    def get_connection() -> sqlite3.Connection:
-        conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+    @classmethod
+    def get_settings(cls, difficulty: str) -> Dict[str, Any]:
+        return cls.DIFFICULTIES.get(difficulty, cls.DIFFICULTIES["Standard"])
+
+
+class LeaderboardDB:
+    def __init__(self, db_path: str = DB_FILE):
+        self.db_path = db_path
+        self.init_db()
+
+    def get_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
 
-    @classmethod
-    def init_db(cls):
-        conn = cls.get_connection()
-        cursor = conn.cursor()
-        
-        # Create tables if not exist
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS personas (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL,
-                system_prompt TEXT NOT NULL,
-                description TEXT
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                persona_id INTEGER,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (persona_id) REFERENCES personas(id)
-            )
-        ''')
-
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id INTEGER,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                tokens_used INTEGER DEFAULT 0,
-                FOREIGN KEY (session_id) REFERENCES sessions(id)
-            )
-        ''')
-        
-        conn.commit()
-        
-        # Self-healing check for columns in messages
-        cursor.execute("PRAGMA table_info(messages)")
-        columns = [row["name"] for row in cursor.fetchall()]
-        if "tokens_used" not in columns:
-            cursor.execute("ALTER TABLE messages ADD COLUMN tokens_used INTEGER DEFAULT 0")
+    def init_db(self):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS scores (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    player_name TEXT NOT NULL,
+                    score INTEGER NOT NULL,
+                    difficulty TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
             conn.commit()
-            
-        # Seed default personas if empty
-        cursor.execute("SELECT COUNT(*) as cnt FROM personas")
-        if cursor.fetchone()["cnt"] == 0:
-            default_personas = [
-                ("Friendly Assistant", "You are a warm, helpful, and cheerful AI assistant.", "Friendly and conversational."),
-                ("Senior Software Architect", "You are a pragmatic, expert Principal Software Architect focused on clean code, testability, and resilience.", "Technical and architectural advisor."),
-                ("Socratic Tutor", "You are a wise tutor who guides users to answers by asking thoughtful, probing questions rather than just giving solutions.", "Educational and reflective."),
-                ("Poetic Bard", "You respond to every prompt with poetic flair, metaphor, and lyrical verse.", "Creative and artistic.")
-            ]
-            cursor.executemany("INSERT INTO personas (name, system_prompt, description) VALUES (?, ?, ?)", default_personas)
+            self._migrate_table(cursor)
+
+    def _migrate_table(self, cursor: sqlite3.Cursor):
+        cursor.execute("PRAGMA table_info(scores)")
+        columns = [col[1] for col in cursor.fetchall()]
+        if "created_at" not in columns:
+            cursor.execute("ALTER TABLE scores ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+            cursor.connection.commit()
+
+    def add_score(self, player_name: str, score: int, difficulty: str) -> bool:
+        if not player_name or score < 0:
+            return False
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO scores (player_name, score, difficulty, created_at) VALUES (?, ?, ?, ?)",
+                (player_name.strip()[:20], int(score), difficulty, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            )
             conn.commit()
+        return True
+
+    def get_top_scores(self, limit: int = 10) -> List[Dict[str, Any]]:
+        self.init_db()
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT player_name, score, difficulty, created_at FROM scores ORDER BY score DESC LIMIT ?",
+                    (limit,)
+                )
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
+        except sqlite3.OperationalError:
+            self.init_db()
+            return []
+
+    def get_stats(self) -> Dict[str, Any]:
+        self.init_db()
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*), MAX(score), AVG(score) FROM scores")
+                row = cursor.fetchone()
+                total_games = row[0] or 0
+                high_score = row[1] or 0
+                avg_score = round(row[2] or 0, 1)
+                return {"total_games": total_games, "high_score": high_score, "avg_score": avg_score}
+        except sqlite3.OperationalError:
+            return {"total_games": 0, "high_score": 0, "avg_score": 0}
+
+    def reset_leaderboard(self):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DROP TABLE IF EXISTS scores")
+            conn.commit()
+        self.init_db()
+
+
+def get_game_html(difficulty: str, settings: Dict[str, Any]) -> str:
+    grid_size = settings["grid_size"]
+    time_limit = settings["time_limit"]
+    multiplier = settings["score_multiplier"]
+
+    return f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Neon Slide Puzzle</title>
+    <style>
+        body {{
+            margin: 0;
+            background: #060814;
+            font-family: 'Courier New', Courier, monospace;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            overflow: hidden;
+            color: #00f3ff;
+        }} 
+        #canvas-container {{
+            position: relative;
+            box-shadow: 0 0 30px rgba(0, 243, 255, 0.3);
+            border: 2px solid #00f3ff;
+            border-radius: 12px;
+            background: #0a0e1a;
+        }} 
+        canvas {{
+            display: block;
+            cursor: pointer;
+        }}
+    </style>
+</head>
+<body>
+    <div id="canvas-container">
+        <canvas id="gameCanvas" width="600" height="600"></canvas>
+    </div>
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        const GRID_SIZE = __GRID_SIZE__;
+        const TIME_LIMIT = __TIME_LIMIT__;
+        const MULTIPLIER = __MULTIPLIER__;
+        const TILE_SIZE = Math.floor(400 / GRID_SIZE);
+        const OFFSET_X = (600 - (GRID_SIZE * TILE_SIZE)) / 2;
+        const OFFSET_Y = 120;
+
+        const AudioEngine = {{
+            ctx: null,
+            muted: false,
+            init() {{
+                if (!this.ctx) {{
+                    const AC = window.AudioContext || window.webkitAudioContext;
+                    if (AC) this.ctx = new AC();
+                }}
+                if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
+            }},
+            playTone(freq, type, duration, endFreq) {{
+                if (this.muted) return;
+                try {{
+                    this.init();
+                    if (!this.ctx) return;
+                    const osc = this.ctx.createOscillator();
+                    const gain = this.ctx.createGain();
+                    osc.type = type || 'sine';
+                    osc.frequency.setValueAtTime(freq, this.ctx.currentTime);
+                    if (endFreq) osc.frequency.exponentialRampToValueAtTime(endFreq, this.ctx.currentTime + duration);
+                    gain.gain.setValueAtTime(0.15, this.ctx.currentTime);
+                    gain.gain.exponentialRampToValueAtTime(0.001, this.ctx.currentTime + duration);
+                    osc.connect(gain);
+                    gain.connect(this.ctx.destination);
+                    osc.start();
+                    osc.stop(this.ctx.currentTime + duration);
+                }} catch(e) {{}}
+            }},
+            slide() {{ this.playTone(420, 'square', 0.06, 260); }},
+            score() {{ this.playTone(523, 'sine', 0.1); setTimeout(() => this.playTone(659, 'sine', 0.15), 80); }},
+            win() {{ this.playTone(440, 'triangle', 0.1, 880); }},
+            gameOver() {{ this.playTone(330, 'sawtooth', 0.25, 120); }}
+        }};
+
+        let gameState = 'START'; // START, PLAYING, PAUSED, GAMEOVER, VICTORY
+        let score = 0;
+        let moves = 0;
+        let timeLeft = TIME_LIMIT;
+        let timerInterval = null;
+        let board = [];
+        let emptyCell = {{ r: GRID_SIZE - 1, c: GRID_SIZE - 1 }};
+        let particles = [];
+        let stars = [];
+
+        for (let i = 0; i < 40; i++) {{
+            stars.push({{
+                x: Math.random() * canvas.width,
+                y: Math.random() * canvas.height,
+                size: Math.random() * 2 + 1,
+                speed: Math.random() * 0.5 + 0.2
+            }});
+        }}
+
+        function initBoard() {{
+            board = [];
+            let count = 1;
+            for (let r = 0; r < GRID_SIZE; r++) {{
+                let row = [];
+                for (let c = 0; c < GRID_SIZE; c++) {{
+                    row.push(count++);
+                }}
+                board.push(row);
+            }}
+            board[GRID_SIZE - 1][GRID_SIZE - 1] = 0;
+            emptyCell = {{ r: GRID_SIZE - 1, c: GRID_SIZE - 1 }};
             
-        conn.close()
+            // Shuffle valid moves
+            let shuffleMoves = GRID_SIZE * GRID_SIZE * 20;
+            for (let i = 0; i < shuffleMoves; i++) {{
+                let neighbors = getNeighbors(emptyCell.r, emptyCell.c);
+                let randN = neighbors[Math.floor(Math.random() * neighbors.length)];
+                board[emptyCell.r][emptyCell.c] = board[randN.r][randN.c];
+                board[randN.r][randN.c] = 0;
+                emptyCell = randN;
+            }}
+            moves = 0;
+        }}
 
-    @classmethod
-    def reset_database(cls):
-        conn = cls.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("DROP TABLE IF EXISTS messages")
-        cursor.execute("DROP TABLE IF EXISTS sessions")
-        cursor.execute("DROP TABLE IF EXISTS personas")
-        conn.commit()
-        conn.close()
-        cls.init_db()
+        function getNeighbors(r, c) {{
+            let res = [];
+            if (r > 0) res.push({{ r: r - 1, c: c }});
+            if (r < GRID_SIZE - 1) res.push({{ r: r + 1, c: c }});
+            if (c > 0) res.push({{ r: r, c: c - 1 }});
+            if (c < GRID_SIZE - 1) res.push({{ r: r, c: c + 1 }});
+            return res;
+        }}
 
+        function checkWin() {{
+            let count = 1;
+            for (let r = 0; r < GRID_SIZE; r++) {{
+                for (let c = 0; c < GRID_SIZE; c++) {{
+                    if (r === GRID_SIZE - 1 && c === GRID_SIZE - 1) {{
+                        if (board[r][c] !== 0) return false;
+                    }} else {{
+                        if (board[r][c] !== count++) return false;
+                    }}
+                }}
+            }}
+            return true;
+        }}
 
-class ChatEngine:
-    @staticmethod
-    def generate_response(prompt: str, persona_system_prompt: str, temperature: float, model_name: str) -> Dict[str, Any]:
-        """
-        Simulates an intelligent response based on the persona, prompt, and parameters.
-        """
-        prompt_lower = prompt.lower()
-        
-        # Generate contextual simulation based on persona
-        if "architect" in persona_system_prompt.lower():
-            responses = [
-                f"From an architectural standpoint regarding '{prompt}', we must prioritize modularity, decoupling, and high test coverage. Let's design a clean interface.",
-                f"That's a solid engineering challenge. To address '{prompt}', I recommend starting with a robust data model and defensive error handling (like schema auto-healing).",
-                f"When scaling systems like '{prompt}', separation of concerns is paramount. Ensure your business logic is entirely decoupled from the UI framework."
-            ]
-        elif "socratic" in persona_system_prompt.lower():
-            responses = [
-                f"That is a fascinating inquiry about '{prompt}'. What principles do you think underpin this challenge?",
-                f"Before we solve '{prompt}', let us ask: what would failure look like in this scenario, and how might we prevent it?",
-                f"Why do you suppose '{prompt}' is structured this way? What alternatives have you considered?"
-            ]
-        elif "poetic" in persona_system_prompt.lower():
-            responses = [
-                f"Ah, whispering winds of '{prompt}' arise,\nA dance of logic under starry skies...\nCode flows like rivers to the endless sea,\nIn search of truth and calm serenity.",
-                f"Like autumn leaves upon a digital stream,\n'{prompt}' unfolds into a waking dream.\nBytes intertwine where quiet thoughts belong,\nA silent stanza in an ancient song."
-            ]
-        else:
-            responses = [
-                f"I've processed your request regarding '{prompt}'. Here is what you need to know: everything is running smoothly!",
-                f"That's a great question about '{prompt}'. Let me assist you by breaking down the key points step by step.",
-                f"I understand you are asking about '{prompt}'. Based on my analysis, here are three actionable recommendations..."
-            ]
-            
-        reply_text = random.choice(responses)
-        # Add a bit of flavor if temperature is high
-        if temperature > 0.8:
-            reply_text += f" [Temp: {temperature:.1f}, Model: {model_name}]"
-            
-        tokens = len(prompt.split()) + len(reply_text.split()) + random.randint(5, 20)
-        return {
-            "content": reply_text,
-            "tokens_used": tokens
-        }
+        function addParticles(x, y, color) {{
+            for (let i = 0; i < 15; i++) {{
+                let angle = Math.random() * Math.PI * 2;
+                let speed = Math.random() * 4 + 1;
+                particles.push({{
+                    x: x,
+                    y: y,
+                    vx: Math.cos(angle) * speed,
+                    vy: Math.sin(angle) * speed,
+                    alpha: 1.0,
+                    color: color,
+                    size: Math.random() * 4 + 2
+                }});
+            }}
+        }}
 
+        function startGame() {{
+            initBoard();
+            score = 0;
+            timeLeft = TIME_LIMIT;
+            gameState = 'PLAYING';
+            if (timerInterval) clearInterval(timerInterval);
+            timerInterval = setInterval(() => {{
+                if (gameState === 'PLAYING') {{
+                    timeLeft--;
+                    if (timeLeft <= 0) {{
+                        timeLeft = 0;
+                        gameState = 'GAMEOVER';
+                        AudioEngine.gameOver();
+                        clearInterval(timerInterval);
+                        notifyStreamlitScore(0);
+                    }}
+                }}
+            }}, 1000);
+        }}
 
-class SessionManager:
-    @staticmethod
-    def create_session(title: str, persona_id: int) -> int:
-        conn = DatabaseManager.get_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO sessions (title, persona_id, created_at) VALUES (?, ?, ?)",
-            (title, persona_id, datetime.datetime.now().isoformat())
-        )
-        conn.commit()
-        session_id = cursor.lastrowid
-        conn.close()
-        return session_id
+        function notifyStreamlitScore(finalScore) {{
+            try {{
+                window.parent.postMessage({{
+                    type: 'streamlit:setComponentValue',
+                    value: {{ score: finalScore, status: gameState, difficulty: '__DIFFICULTY__' }}
+                }}, '*');
+            }} catch(e) {{}}
+        }}
 
-    @staticmethod
-    def get_sessions() -> List[Dict[str, Any]]:
-        conn = DatabaseManager.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT s.id, s.title, s.created_at, p.name as persona_name, p.id as persona_id
-            FROM sessions s
-            LEFT JOIN personas p ON s.persona_id = p.id
-            ORDER BY s.id DESC
-        """)
-        rows = [dict(row) for row in cursor.fetchall()]
-        conn.close()
-        return rows
+        canvas.addEventListener('click', (e) => {{
+            AudioEngine.init();
+            const rect = canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
 
-    @staticmethod
-    def get_messages(session_id: int) -> List[Dict[str, Any]]:
-        conn = DatabaseManager.get_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT role, content, timestamp, tokens_used FROM messages WHERE session_id = ? ORDER BY id ASC",
-            (session_id,)
-        )
-        rows = [dict(row) for row in cursor.fetchall()]
-        conn.close()
-        return rows
+            if (gameState === 'START' || gameState === 'GAMEOVER' || gameState === 'VICTORY') {{
+                // Check click on start button
+                if (x >= 200 && x <= 400 && y >= 380 && y <= 450) {{
+                    startGame();
+                    AudioEngine.score();
+                }}
+                return;
+            }}
 
-    @staticmethod
-    def add_message(session_id: int, role: str, content: str, tokens_used: int = 0):
-        conn = DatabaseManager.get_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO messages (session_id, role, content, timestamp, tokens_used) VALUES (?, ?, ?, ?, ?)",
-            (session_id, role, content, datetime.datetime.now().isoformat(), tokens_used)
-        )
-        conn.commit()
-        conn.close()
+            if (gameState === 'PLAYING') {{
+                if (x >= OFFSET_X && x <= OFFSET_X + GRID_SIZE * TILE_SIZE &&
+                    y >= OFFSET_Y && y <= OFFSET_Y + GRID_SIZE * TILE_SIZE) {{
+                    let c = Math.floor((x - OFFSET_X) / TILE_SIZE);
+                    let r = Math.floor((y - OFFSET_Y) / TILE_SIZE);
 
-    @staticmethod
-    def get_personas() -> List[Dict[str, Any]]:
-        conn = DatabaseManager.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, name, system_prompt, description FROM personas")
-        rows = [dict(row) for row in cursor.fetchall()]
-        conn.close()
-        return rows
+                    let neighbors = getNeighbors(emptyCell.r, emptyCell.c);
+                    let clickedNeighbor = neighbors.find(n => n.r === r && n.c === c);
 
-    @staticmethod
-    def add_persona(name: str, system_prompt: str, description: str):
-        conn = DatabaseManager.get_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT OR IGNORE INTO personas (name, system_prompt, description) VALUES (?, ?, ?)",
-            (name, system_prompt, description)
-        )
-        conn.commit()
-        conn.close()
+                    if (clickedNeighbor) {{
+                        board[emptyCell.r][emptyCell.c] = board[r][c];
+                        board[r][c] = 0;
+                        emptyCell = {{ r: r, c: c }};
+                        moves++;
+                        AudioEngine.slide();
+                        addParticles(OFFSET_X + c * TILE_SIZE + TILE_SIZE/2, OFFSET_Y + r * TILE_SIZE + TILE_SIZE/2, '#00f3ff');
 
+                        if (checkWin()) {{
+                            gameState = 'VICTORY';
+                            AudioEngine.win();
+                            clearInterval(timerInterval);
+                            let bonus = Math.max(100, timeLeft * 10) * MULTIPLIER;
+                            score = Math.floor(1000 + bonus - (moves * 5));
+                            if (score < 100) score = 100;
+                            addParticles(300, 300, '#ffe600');
+                            notifyStreamlitScore(score);
+                        }}
+                    }}
+                }}
+            }}
+        }});
 
-# ==========================================
-# 2. STREAMLIT WEB INTERFACE
-# ==========================================
+        window.addEventListener('keydown', (e) => {{
+            if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) {{
+                e.preventDefault();
+            }}
+            AudioEngine.init();
+            if (gameState === 'PLAYING') {{
+                let tr = emptyCell.r;
+                let tc = emptyCell.c;
+                if (e.key === 'ArrowUp' || e.key === 'w') tr++;
+                if (e.key === 'ArrowDown' || e.key === 's') tr--;
+                if (e.key === 'ArrowLeft' || e.key === 'a') tc++;
+                if (e.key === 'ArrowRight' || e.key === 'd') tc--;
+
+                if (tr >= 0 && tr < GRID_SIZE && tc >= 0 && tc < GRID_SIZE) {{
+                    board[emptyCell.r][emptyCell.c] = board[tr][tc];
+                    board[tr][tc] = 0;
+                    emptyCell = {{ r: tr, c: tc }};
+                    moves++;
+                    AudioEngine.slide();
+                    if (checkWin()) {{
+                        gameState = 'VICTORY';
+                        AudioEngine.win();
+                        clearInterval(timerInterval);
+                        let bonus = Math.max(100, timeLeft * 10) * MULTIPLIER;
+                        score = Math.floor(1000 + bonus - (moves * 5));
+                        if (score < 100) score = 100;
+                        notifyStreamlitScore(score);
+                    }}
+                }}
+            }} else if (e.key === ' ' || e.key === 'Enter') {{
+                if (gameState === 'START' || gameState === 'GAMEOVER' || gameState === 'VICTORY') {{
+                    startGame();
+                }}
+            }}
+        }});
+
+        function update() {{
+            for (let s of stars) {{
+                s.y += s.speed;
+                if (s.y > canvas.height) s.y = 0;
+            }}
+            for (let i = particles.length - 1; i >= 0; i--) {{
+                let p = particles[i];
+                p.x += p.vx;
+                p.y += p.vy;
+                p.alpha -= 0.03;
+                if (p.alpha <= 0) particles.splice(i, 1);
+            }}
+        }}
+
+        function draw() {{
+            ctx.fillStyle = '#060814';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // Stars
+            ctx.fillStyle = '#ffffff';
+            for (let s of stars) {{
+                ctx.globalAlpha = 0.5;
+                ctx.fillRect(s.x, s.y, s.size, s.size);
+            }}
+            ctx.globalAlpha = 1.0;
+
+            // HUD
+            ctx.font = 'bold 20px "Courier New", monospace';
+            ctx.fillStyle = '#00f3ff';
+            ctx.shadowBlur = 10;
+            ctx.shadowColor = '#00f3ff';
+            ctx.fillText("MODE: " + '__DIFFICULTY__'.toUpperCase(), 30, 40);
+            ctx.fillText("MOVES: " + moves, 30, 75);
+            ctx.fillText("TIME: " + timeLeft + "s", 450, 40);
+            ctx.shadowBlur = 0;
+
+            if (gameState === 'START') {{
+                ctx.fillStyle = '#ff007f';
+                ctx.shadowBlur = 15;
+                ctx.shadowColor = '#ff007f';
+                ctx.font = 'bold 36px "Courier New", monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText("NEON SLIDE PUZZLE", canvas.width / 2, 180);
+
+                ctx.fillStyle = '#00f3ff';
+                ctx.font = '16px "Courier New", monospace';
+                ctx.fillText("Slide tiles into numerical order (1 to N²-1)", canvas.width / 2, 230);
+                ctx.fillText("Use Mouse Clicks or Arrow Keys / WASD", canvas.width / 2, 260);
+
+                // Button
+                ctx.fillStyle = '#0a0e1a';
+                ctx.strokeStyle = '#00ff66';
+                ctx.lineWidth = 3;
+                ctx.shadowBlur = 12;
+                ctx.shadowColor = '#00ff66';
+                ctx.fillRect(200, 380, 200, 60);
+                ctx.strokeRect(200, 380, 200, 60);
+
+                ctx.fillStyle = '#00ff66';
+                ctx.font = 'bold 22px "Courier New", monospace';
+                ctx.fillText("START GAME", canvas.width / 2, 418);
+                ctx.textAlign = 'left';
+                ctx.shadowBlur = 0;
+
+            }} else if (gameState === 'PLAYING' || gameState === 'PAUSED') {{
+                // Draw board
+                for (let r = 0; r < GRID_SIZE; r++) {{
+                    for (let c = 0; c < GRID_SIZE; c++) {{
+                        let val = board[r][c];
+                        let tx = OFFSET_X + c * TILE_SIZE;
+                        let ty = OFFSET_Y + r * TILE_SIZE;
+
+                        if (val !== 0) {{
+                            ctx.fillStyle = '#101830';
+                            ctx.strokeStyle = '#00f3ff';
+                            ctx.lineWidth = 2;
+                            ctx.shadowBlur = 8;
+                            ctx.shadowColor = '#00f3ff';
+                            ctx.fillRect(tx + 4, ty + 4, TILE_SIZE - 8, TILE_SIZE - 8);
+                            ctx.strokeRect(tx + 4, ty + 4, TILE_SIZE - 8, TILE_SIZE - 8);
+
+                            ctx.fillStyle = '#ffffff';
+                            ctx.font = 'bold ' + Math.floor(TILE_SIZE * 0.4) + 'px "Courier New", monospace';
+                            ctx.textAlign = 'center';
+                            ctx.textBaseline = 'middle';
+                            ctx.fillText(val, tx + TILE_SIZE / 2, ty + TILE_SIZE / 2);
+                            ctx.textAlign = 'left';
+                            ctx.textBaseline = 'alphabetic';
+                            ctx.shadowBlur = 0;
+                        }} else {{
+                            ctx.fillStyle = '#04060d';
+                            ctx.fillRect(tx + 4, ty + 4, TILE_SIZE - 8, TILE_SIZE - 8);
+                        }}
+                    }}
+                }}
+
+            }} else if (gameState === 'GAMEOVER' || gameState === 'VICTORY') {{
+                ctx.fillStyle = 'rgba(6, 8, 20, 0.85)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                ctx.textAlign = 'center';
+                ctx.shadowBlur = 20;
+                if (gameState === 'VICTORY') {{
+                    ctx.fillStyle = '#00ff66';
+                    ctx.shadowColor = '#00ff66';
+                    ctx.font = 'bold 36px "Courier New", monospace';
+                    ctx.fillText("VICTORY!", canvas.width / 2, 200);
+
+                    ctx.fillStyle = '#ffffff';
+                    ctx.font = '22px "Courier New", monospace';
+                    ctx.fillText("Final Score: " + score, canvas.width / 2, 260);
+                    ctx.fillText("Moves: " + moves + " | Time Left: " + timeLeft + "s", canvas.width / 2, 300);
+                }} else {{
+                    ctx.fillStyle = '#ff007f';
+                    ctx.shadowColor = '#ff007f';
+                    ctx.font = 'bold 36px "Courier New", monospace';
+                    ctx.fillText("TIME'S UP!", canvas.width / 2, 200);
+
+                    ctx.fillStyle = '#ffffff';
+                    ctx.font = '22px "Courier New", monospace';
+                    ctx.fillText("Better luck next time!", canvas.width / 2, 260);
+                }}
+                ctx.shadowBlur = 0;
+
+                // Play Again Button
+                ctx.fillStyle = '#0a0e1a';
+                ctx.strokeStyle = '#00f3ff';
+                ctx.lineWidth = 3;
+                ctx.shadowBlur = 12;
+                ctx.shadowColor = '#00f3ff';
+                ctx.fillRect(200, 380, 200, 60);
+                ctx.strokeRect(200, 380, 200, 60);
+
+                ctx.fillStyle = '#00f3ff';
+                ctx.font = 'bold 20px "Courier New", monospace';
+                ctx.fillText("PLAY AGAIN", canvas.width / 2, 417);
+                ctx.textAlign = 'left';
+                ctx.shadowBlur = 0;
+            }}
+
+            // Particles
+            for (let p of particles) {{
+                ctx.save();
+                ctx.globalAlpha = p.alpha;
+                ctx.fillStyle = p.color;
+                ctx.shadowBlur = 10;
+                ctx.shadowColor = p.color;
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.restore();
+            }}
+        }}
+
+        function loop() {{
+            update();
+            draw();
+            requestAnimationFrame(loop);
+        }}
+
+        requestAnimationFrame(loop);
+    </script>
+</body>
+</html>
+""".replace("__GRID_SIZE__", str(grid_size)).replace("__TIME_LIMIT__", str(time_limit)).replace("__MULTIPLIER__", str(multiplier)).replace("__DIFFICULTY__", difficulty)
+
 
 def main():
     st.set_page_config(
-        page_title="OmniChat Pro - Advanced AI Chatbot",
-        page_icon="💬",
-        layout="wide"
+        page_title="Neon Slide & Match Puzzle",
+        page_icon="🧩",
+        layout="centered"
     )
 
-    # Initialize Database
-    DatabaseManager.init_db()
+    db = LeaderboardDB()
 
-    # Session state initialization
-    if "current_session_id" not in st.session_state:
-        sessions = SessionManager.get_sessions()
-        if sessions:
-            st.session_state.current_session_id = sessions[0]["id"]
-        else:
-            personas = SessionManager.get_personas()
-            default_pid = personas[0]["id"] if personas else 1
-            st.session_state.current_session_id = SessionManager.create_session("New Chat", default_pid)
+    st.sidebar.title("🧩 Arcade Settings")
+    difficulty = st.sidebar.selectbox("Select Difficulty", list(GameConfig.DIFFICULTIES.keys()), index=1)
+    settings = GameConfig.get_settings(difficulty)
 
-    # --- SIDEBAR CONFIGURATION --- 
-    st.sidebar.title("💬 OmniChat Pro")
-    st.sidebar.markdown("Your intelligent, multi-persona AI assistant hub.")
-
-    # Navigation mode
-    nav_mode = st.sidebar.radio("Navigation", ["Chat", "Analytics & History", "Persona Manager"])
-
-    st.sidebar.markdown("--- ✨ Model Settings ---")
-    
-    # Model Settings
-    model_name = st.sidebar.selectbox("AI Engine", ["OmniBot-v4-Turbo", "DeepLogic-Pro", "CreativeGen-7B"], index=0)
-    temperature = st.sidebar.slider("Temperature", min_value=0.0, max_value=1.0, value=0.7, step=0.1)
-    
-    # Persona Selector for current or new chat
-    personas = SessionManager.get_personas()
-    persona_dict = {p["name"]: p for p in personas}
-    selected_persona_name = st.sidebar.selectbox("Active Persona", list(persona_dict.keys()))
-    active_persona = persona_dict[selected_persona_name]
-
-    st.sidebar.divider()
-    st.sidebar.subheader("📂 Chat Sessions")
-    
-    if st.sidebar.button("➕ Start New Chat", use_container_width=True):
-        new_id = SessionManager.create_session(f"Chat {datetime.datetime.now().strftime('%H:%M:%S')}", active_persona["id"])
-        st.session_state.current_session_id = new_id
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Database Manager")
+    if st.sidebar.button("Reset Leaderboard DB"):
+        db.reset_leaderboard()
+        st.sidebar.success("Leaderboard wiped clean!")
         st.rerun()
 
-    sessions = SessionManager.get_sessions()
-    for sess in sessions:
-        sess_label = f"{sess['title']} ({sess['persona_name'] or 'Default'})"
-        if sess['id'] == st.session_state.current_session_id:
-            sess_label = f"👉 {sess_label}"
-        if st.sidebar.button(sess_label, key=f"sess_{sess['id']}", use_container_width=True):
-            st.session_state.current_session_id = sess['id']
-            st.rerun()
+    st.title("⚡ NEON SLIDE PUZZLE ⚡")
+    st.markdown(f"*Cyberpunk 15-Puzzle Arcade Experience ({difficulty} Mode)*")
 
-    # Database Reset Utility
-    with st.sidebar.expander("⚙️ Advanced Settings"):
-        if st.button("Reset Database & Clear All", type="primary"):
-            DatabaseManager.reset_database()
-            st.success("Database reset successfully!")
-            st.rerun()
+    # Render HTML Game Component
+    game_html = get_game_html(difficulty, settings)
+    components.html(game_html, height=640, scrolling=False)
 
-    # ==========================================
-    # PAGE: CHAT INTERFACE
-    # ==========================================
-    if nav_mode == "Chat":
-        st.title("🤖 Chat Workspace")
-        st.markdown(f"**Active Persona:** `{active_persona['name']}` — *{active_persona['description']}*")
-        
-        # Fetch messages for current session
-        messages = SessionManager.get_messages(st.session_state.current_session_id)
-        
-        # Display chat history
-        for msg in messages:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
-                if msg.get("tokens_used", 0) > 0:
-                    st.caption(f"Tokens: {msg['tokens_used']} | {msg['timestamp'][:19]}")
+    st.markdown("---")
+    col1, col2 = st.columns(2)
 
-        # Quick Prompt Suggestions
-        st.markdown("**💡 Quick Prompts:**")
-        col_q1, col_q2, col_q3 = st.columns(3)
-        quick_prompt = None
-        with col_q1:
-            if st.button("Explain Clean Architecture", use_container_width=True):
-                quick_prompt = "Explain the principles of clean architecture in Python."
-        with col_q2:
-            if st.button("Write a Python Decorator", use_container_width=True):
-                quick_prompt = "Write a robust Python decorator for retry logic with exponential backoff."
-        with col_q3:
-            if st.button("Debug a SQLite Issue", use_container_width=True):
-                quick_prompt = "How do I safely handle schema migrations in SQLite without data loss?"
+    with col1:
+        st.subheader("🏆 Submit Your Score")
+        stats = db.get_stats()
+        with st.form("score_form"):
+            player_name = st.text_input("Player Handle", max_chars=20, placeholder="CyberGamer99")
+            reported_score = st.number_input("Final Score (from game victory)", min_value=0, value=0, step=10)
+            submit_btn = st.form_submit_button("Record to Global Leaderboard")
 
-        # Chat Input
-        user_prompt = st.chat_input("Message OmniChat...") or quick_prompt
-        
-        if user_prompt:
-            # Render user message immediately
-            with st.chat_message("user"):
-                st.markdown(user_prompt)
-            SessionManager.add_message(st.session_state.current_session_id, "user", user_prompt)
-            
-            # Generate assistant response
-            with st.chat_message("assistant"):
-                with st.spinner("Thinking..."):
-                    res = ChatEngine.generate_response(
-                        prompt=user_prompt,
-                        persona_system_prompt=active_persona["system_prompt"],
-                        temperature=temperature,
-                        model_name=model_name
-                    )
-                    st.markdown(res["content"])
-                    st.caption(f"Tokens: {res['tokens_used']}")
-            
-            SessionManager.add_message(
-                st.session_state.current_session_id,
-                "assistant",
-                res["content"],
-                tokens_used=res["tokens_used"]
-            )
-            st.rerun()
-
-    # ==========================================
-    # PAGE: ANALYTICS & HISTORY
-    # ==========================================
-    elif nav_mode == "Analytics & History":
-        st.title("📊 Chat Analytics & History")
-        st.markdown("Review your conversation statistics, token usage, and message logs across all sessions.")
-        
-        conn = DatabaseManager.get_connection()
-        df_sessions = pd.read_sql_query("SELECT * FROM sessions", conn)
-        df_messages = pd.read_sql_query("SELECT * FROM messages", conn)
-        df_personas = pd.read_sql_query("SELECT * FROM personas", conn)
-        conn.close()
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Total Sessions", len(df_sessions))
-        with col2:
-            st.metric("Total Messages", len(df_messages))
-        with col3:
-            total_tokens = int(df_messages["tokens_used"].sum()) if not df_messages.empty else 0
-            st.metric("Total Tokens Consumed", total_tokens)
-            
-        st.subheader("📈 Message Distribution by Role")
-        if not df_messages.empty:
-            role_counts = df_messages["role"].value_counts().reset_index()
-            role_counts.columns = ["Role", "Count"]
-            st.dataframe(role_counts, use_container_width=True)
-        else:
-            st.info("No message data available yet.")
-            
-        st.subheader("📂 All Sessions Log")
-        if not df_sessions.empty:
-            st.dataframe(df_sessions, use_container_width=True)
-        else:
-            st.info("No sessions recorded.")
-
-    # ==========================================
-    # PAGE: PERSONA MANAGER
-    # ==========================================
-    elif nav_mode == "Persona Manager":
-        st.title("🎭 AI Persona Manager")
-        st.markdown("Create custom AI personalities with tailored system instructions.")
-        
-        with st.form("new_persona_form"):
-            st.subheader("Create New Persona")
-            p_name = st.text_input("Persona Name")
-            p_desc = st.text_input("Short Description")
-            p_prompt = st.text_area("System Prompt / Instructions", placeholder="You are an expert in...")
-            submitted = st.form_submit_button("Save Persona")
-            
-            if submitted:
-                if p_name and p_prompt:
-                    try:
-                        SessionManager.add_persona(p_name, p_prompt, p_desc)
-                        st.success(f"Persona '{p_name}' created successfully!")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Error creating persona: {e}")
+            if submit_btn:
+                if db.add_score(player_name, reported_score, difficulty):
+                    st.success(f"Score {reported_score} successfully recorded for {player_name}!")
+                    st.rerun()
                 else:
-                    st.warning("Please provide both a Name and System Prompt.")
-                    
-        st.subheader("Existing Personas")
-        personas = SessionManager.get_personas()
-        for p in personas:
-            with st.expander(f"{p['name']} - {p['description']}"):
-                st.markdown(f"**System Prompt:**\n> {p['system_prompt']}")
+                    st.error("Please provide a valid player handle and score.")
+
+    with col2:
+        st.subheader("📊 Arcade Statistics")
+        st.metric("Total Games Played", stats["total_games"])
+        st.metric("All-Time High Score", stats["high_score"])
+        st.metric("Average Score", stats["avg_score"])
+
+    st.markdown("---")
+    st.subheader("🌟 Global Neon Leaderboard")
+    top_scores = db.get_top_scores(10)
+    if top_scores:
+        st.dataframe(
+            top_scores,
+            column_config={
+                "player_name": "Player",
+                "score": "Score",
+                "difficulty": "Difficulty",
+                "created_at": "Timestamp"
+            },
+            hide_index=True,
+            use_container_width=True
+        )
+    else:
+        st.info("No high scores recorded yet. Be the first on the grid!")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

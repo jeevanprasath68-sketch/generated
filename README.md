@@ -1,10 +1,10 @@
 # Generated Application
 
-**Requirement:** create a general chatbot
+**Requirement:** create a simple working puzzle game.
 
 **Format:** Streamlit Web App
 
-**Status:** VERIFIED &bull; **Score:** 8.8/10
+**Status:** VERIFIED &bull; **Score:** 9.5/10
 
 ## Quick Start (Local)
 ```bash
