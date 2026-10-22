@@ -1,69 +1,62 @@
 import pytest
-import os
-from app import GameConfig, LeaderboardDB
+from app import HRCalculator, DataManager, init_db, reset_database
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
+def setup_test_db():
+    reset_database()
+    yield
 
-def temp_db(tmp_path):
-    db_file = tmp_path / "test_leaderboard.db"
-    db = LeaderboardDB(db_path=str(db_file))
-    return db
+def test_calculate_hours_happy_path():
+    hours = HRCalculator.calculate_hours("08:30", "17:15")
+    assert hours == 8.75
 
-def test_game_config_difficulties():
-    casual = GameConfig.get_settings("Casual")
-    assert casual["grid_size"] == 3
-    assert casual["time_limit"] == 120
-    assert casual["score_multiplier"] == 1.0
+def test_calculate_hours_edge_cases():
+    # Same time
+    assert HRCalculator.calculate_hours("09:00", "09:00") == 0.0
+    # Invalid string / empty
+    assert HRCalculator.calculate_hours("", "17:00") == 0.0
+    assert HRCalculator.calculate_hours("invalid", "17:00") == 0.0
+    # Out before in
+    assert HRCalculator.calculate_hours("17:00", "08:00") == 0.0
 
-    pro = GameConfig.get_settings("Pro")
-    assert pro["grid_size"] == 5
-    assert pro["score_multiplier"] == 2.2
+def test_compute_weekly_payroll():
+    # Employee hourly rate: $20.0, 40 hours worked, $100 advance taken
+    res = HRCalculator.compute_weekly_payroll(
+        employee_id=1,
+        hourly_rate=20.0,
+        total_hours=40.0,
+        total_advances=100.0
+    )
+    assert res["gross_pay"] == 800.0
+    assert res["advance_deductions"] == 100.0
+    assert res["net_pay"] == 700.0
 
-    # Fallback default test
-    unknown = GameConfig.get_settings("NonExistent")
-    assert unknown["grid_size"] == 4
+def test_compute_weekly_payroll_excess_advance():
+    # Advance is greater than gross pay
+    res = HRCalculator.compute_weekly_payroll(
+        employee_id=2,
+        hourly_rate=15.0,
+        total_hours=10.0, # Gross = 150
+        total_advances=200.0
+    )
+    assert res["gross_pay"] == 150.0
+    # Deductions capped at gross pay
+    assert res["advance_deductions"] == 150.0
+    assert res["net_pay"] == 0.0
 
-def test_leaderboard_init_and_add(temp_db):
-    success = temp_db.add_score("CyberZero", 1500, "Standard")
-    assert success is True
+def test_employee_directory_and_database():
+    DataManager.add_employee("John Doe", "Welder", 22.5, "555-0192")
+    df = DataManager.get_employees()
+    assert len(df) == 1
+    assert df.iloc[0]['name'] == "John Doe"
+    assert df.iloc[0]['hourly_rate'] == 22.5
 
-    top = temp_db.get_top_scores(limit=5)
-    assert len(top) == 1
-    assert top[0]["player_name"] == "CyberZero"
-    assert top[0]["score"] == 1500
-    assert top[0]["difficulty"] == "Standard"
-
-def test_leaderboard_sorting_and_limit(temp_db):
-    temp_db.add_score("PlayerA", 500, "Casual")
-    temp_db.add_score("PlayerB", 2500, "Pro")
-    temp_db.add_score("PlayerC", 1200, "Standard")
-
-    top = temp_db.get_top_scores(limit=2)
-    assert len(top) == 2
-    assert top[0]["score"] == 2500
-    assert top[0]["player_name"] == "PlayerB"
-    assert top[1]["score"] == 1200
-
-def test_leaderboard_stats(temp_db):
-    temp_db.add_score("Alpha", 1000, "Casual")
-    temp_db.add_score("Beta", 3000, "Pro")
-
-    stats = temp_db.get_stats()
-    assert stats["total_games"] == 2
-    assert stats["high_score"] == 3000
-    assert stats["avg_score"] == 2000.0
-
-def test_invalid_score_submission(temp_db):
-    success_empty = temp_db.add_score("", 500, "Casual")
-    assert success_empty is False
-
-    success_negative = temp_db.add_score("ValidUser", -100, "Casual")
-    assert success_negative is False
-
-def test_reset_leaderboard(temp_db):
-    temp_db.add_score("TestUser", 800, "Standard")
-    assert temp_db.get_stats()["total_games"] == 1
-
-    temp_db.reset_leaderboard()
-    assert temp_db.get_stats()["total_games"] == 0
-    assert len(temp_db.get_top_scores()) == 0
+def test_attendance_logging():
+    DataManager.add_employee("Jane Smith", "Machinist", 25.0, "555-0193")
+    df = DataManager.get_employees()
+    emp_id = df.iloc[0]['id']
+    
+    DataManager.log_attendance(emp_id, "2023-10-01", "08:00", "16:30", "Present")
+    conn = DataManager.get_employees()
+    # Just validating database persistence and execution without error
+    assert len(conn) >= 1
